@@ -1,0 +1,17 @@
+# 忽略 Python 的缓存文件
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 忽略虚拟环境（如果你以后建了的话）
+venv/
+env/
+
+# 忽略巨大的模型文件和物理缓存
+*.pkl
+*.pth
+models/
+mitdb/
+
+
+.vs/
