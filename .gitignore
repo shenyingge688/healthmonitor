@@ -1,17 +1,29 @@
-# å¿½ç•¥ Python çš„ç¼“å­˜æ–‡ä»¶
+# Python »º´æ
 __pycache__/
 *.py[cod]
 *$py.class
 
-# å¿½ç•¥è™šæ‹Ÿç¯å¢ƒï¼ˆå¦‚æœä½ ä»¥åå»ºäº†çš„è¯ï¼‰
+# ĞéÄâ»·¾³
 venv/
 env/
 
-# å¿½ç•¥å·¨å¤§çš„æ¨¡å‹æ–‡ä»¶å’Œç‰©ç†ç¼“å­˜
-*.pkl
-*.pth
-models/
-mitdb/
+# Ä£ĞÍÎÄ¼şÓëº£Á¿Êı¾İ
+models/*.pth
+dataset/*.pt
+dataset/*.dat
+dataset/*.hea
 
+# Êı¾İ¿âÎÄ¼ş
+*.db
+*.sqlite3
 
+# »·¾³±äÁ¿ÓëÏµÍ³ÎÄ¼ş
+.env
+.DS_Store
+
+# =============== ĞÂÔöÏÂÃæÕâ¿é ===============
+# IDE »º´æÎÄ¼ş (Visual Studio / VS Code)
 .vs/
+.vscode/
+*.suo
+*.user
