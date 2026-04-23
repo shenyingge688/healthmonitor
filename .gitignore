@@ -1,29 +1,23 @@
-# Python 缓存
+# 忽略 Python 缓存与运行环境
 __pycache__/
-*.py[cod]
-*$py.class
-
-# 虚拟环境
+*.pyc
 venv/
-env/
-
-# 模型文件与海量数据
-models/*.pth
-dataset/*.pt
-dataset/*.dat
-dataset/*.hea
-
-# 数据库文件
-*.db
-*.sqlite3
-
-# 环境变量与系统文件
 .env
-.DS_Store
 
-# =============== 新增下面这块 ===============
-# IDE 缓存文件 (Visual Studio / VS Code)
+# 忽略数据集和原始 MIT-BIH 心电数据
+dataset/
+data/mitdb/
+*.pt
+*.dat
+*.hea
+*.atr
+
+# 忽略模型最佳权重存档
+models/
+*.pth
+*.h5
+
+# 忽略系统级隐藏文件
+.DS_Storegit --version
+
 .vs/
-.vscode/
-*.suo
-*.user
