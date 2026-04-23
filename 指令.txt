@@ -12,3 +12,4 @@ py train_massive_v5.py
 py validation_v5_pro.py
 上传
 .\upload.bat
+.\upload_branch.bat
