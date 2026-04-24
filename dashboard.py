@@ -29,7 +29,10 @@ clinical_cases = {
     "119": {"bed_label": "心电档案 119 (室性早搏特征)", "desc": "⚠️ 形态畸变：包含大量室性早搏 (V) 畸变波形。代表 Class 1。"},
     "201": {"bed_label": "心电档案 201 (房颤演变特征)", "desc": "🚨 节律失序：RR间期绝对不齐，呈现典型房颤特征。代表 Class 2。"},
     "207": {"bed_label": "心电档案 207 (室速/室扑前驱)", "desc": "⚡ 极危恶性：短阵室性心动过速与室扑交替发作。代表 Class 4。"},
-    "209": {"bed_label": "心电档案 209 (房性激惹特征)", "desc": "⚠️ 室上性激惹：存在阵发性室上速/房速发作特征。代表 Class 5。"}
+    "209": {"bed_label": "心电档案 209 (房性激惹特征)", "desc": "⚠️ 室上性激惹：存在阵发性室上速/房速发作特征。代表 Class 5。"},
+    
+   
+    "PROSIM_01": {"bed_label": "外部硬件源 (ProSim 200)", "desc": "🔌 示波器直连：硬件模拟病患生理电信号。"}
 }
 
 # 状态管理器初始化
@@ -61,15 +64,29 @@ def clean_ecg_signal(data, fs=360):
 
 @st.cache_data
 def load_sim_data(rec_id):
-    """离线读取 MIT-BIH 原始数据，滤波并重采样至 250Hz"""
+    """离线读取 MIT-BIH 原始数据，或加载外部示波器硬件数据"""
+    
+    # =========================================
+    # 拦截并读取外部硬件传入的信号
+    # =========================================
+    if rec_id == "PROSIM_01":
+        # 直接加载预处理好的物理设备数据 (确保 .npy 文件与本代码在同一目录下)
+        return np.load("prosim_custom_signal.npy")
+
+    # =========================================
+    # 继续读取 MIT-BIH 数据库
+    # =========================================
     base_dir = os.path.dirname(os.path.abspath(__file__))
     data_dir = os.path.join(base_dir, 'data', 'mitdb')
     rec_path = os.path.join(data_dir, rec_id)
-
-    record = wfdb.rdrecord(rec_path, sampto=300000) if os.path.exists(rec_path + ".dat") else wfdb.rdrecord(rec_id, pn_dir='mitdb', sampto=300000)
+    
+    if os.path.exists(rec_path + ".dat"):
+        record = wfdb.rdrecord(rec_path, sampto=300000)
+    else:
+        record = wfdb.rdrecord(rec_id, pn_dir='mitdb', sampto=300000)
+        
     raw_ecg = record.p_signal[:, 0]
-    return signal.resample_poly(clean_ecg_signal(raw_ecg, fs=360), 250, 360) 
-
+    return signal.resample_poly(clean_ecg_signal(raw_ecg, fs=360), 250, 360)
 data_source = load_sim_data(selected_id)
 
 # ==========================================
@@ -185,7 +202,7 @@ if st.sidebar.button("🔴 启动预警引擎", use_container_width=True):
             ).properties(height=60).configure_view(strokeOpacity=0)
             cam_placeholder.altair_chart(cam_chart, use_container_width=True)
 
-        # 6. 中央预警看板动态更新 (温和版 UI + 消除 HTML 缩进乱码) ---
+        # 6. 中央预警看板动态更新  ---
         diag_info = INFERENCE_MAP.get(pred_class, INFERENCE_MAP[0])
         accent_color = diag_info["color"]
         status_title = diag_info["title"]

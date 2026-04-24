@@ -6,6 +6,27 @@ from torch.utils.data import TensorDataset, DataLoader
 import os
 from tqdm import tqdm
 from dl_model import HybridWarningNet
+import torch.nn as nn
+import torch.nn.functional as F
+
+# ==========================================
+# 自定义 Focal Loss (焦点损失函数)
+# 作用：动态降低容易分类样本的权重，迫使模型仔细分辨 PVC 和 VT 的细微差别
+# ==========================================
+class WeightedFocalLoss(nn.Module):
+    def __init__(self, alpha=None, gamma=2.0):
+        super(WeightedFocalLoss, self).__init__()
+        self.alpha = alpha # 传入您的 class_weights 张量
+        self.gamma = gamma # 聚焦参数，通常设为 2.0
+
+    def forward(self, inputs, targets):
+        # 计算基础交叉熵 (支持 Label Smoothing 的软标签)
+        ce_loss = F.cross_entropy(inputs, targets, weight=self.alpha, reduction='none')
+        # 计算 pt (模型对正确类别的预测概率)
+        pt = torch.exp(-ce_loss)
+        # 施加 Focal 动态调节因子
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        return focal_loss.mean()
 
 # ==========================================
 # 训练环境与配置初始化
@@ -35,8 +56,7 @@ model = HybridWarningNet().to(device)
 # 临床重症防漏报权重：极度重罚室颤(VF)和室速(VT)的漏报
 class_weights = torch.tensor([1.0, 1.5, 3.0, 6.0, 5.0, 4.0], dtype=torch.float32).to(device)
 
-# CrossEntropyLoss 内部自动执行 Softmax 
-criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+criterion = WeightedFocalLoss(alpha=class_weights, gamma=2.0)
 
 optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=5, factor=0.5)
