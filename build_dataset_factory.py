@@ -66,19 +66,27 @@ try:
 except Exception as e:
     print(f"⚠️ 数据库同步提示: {e}")
 
+# 定义多分类映射字典
+def get_class_from_annotation(symbol, aux_note):
+    # 优先匹配节律级恶性事件 (aux_note)
+    if aux_note:
+        note = aux_note.upper()
+        if '(VFIB' in note or '(VFL' in note: return 3
+        if '(VT' in note: return 4
+        if '(AFIB' in note: return 2
+        if '(AFL' in note or '(SVT' in note or '(AT' in note: return 5
+    
+    # 匹配心搏级事件 (symbol)
+    if symbol in ['V', 'E']: return 1 # PVC
+    if symbol in ['N', '.', '/', 'L', 'R', 'e', 'j']: return 0
+    return 0
 # ==========================================
 # 模块 4：核心数据集构建引擎
 # ==========================================
 def build_balanced_dataset(record_list, name, risk_threshold=20):
-    """
-    功能：遍历心电记录，提取时序切片并打标，最终强制 1:1 平衡并加入标签平滑。
-    参数：
-        risk_threshold: 未来 5 分钟内出现 20 个异常搏动即判定为高危（逼近频发早搏临床标准）。
-    """
-    X_normal, X_risk = [], []
+    X_multi, Y_multi = [], []
     
     pbar = tqdm(record_list, desc=f"构建数据集 [{name}]", unit="rec", dynamic_ncols=True, file=sys.stdout)
-
     for rec in pbar:
         try:
             rec_path = os.path.join(DATA_DIR, rec)
@@ -86,63 +94,74 @@ def build_balanced_dataset(record_list, name, risk_threshold=20):
             annotation = wfdb.rdann(rec_path, 'atr')
             raw_ecg = record.p_signal[:, 0]
             
-            # 1. 滤波与重采样 (提速方案)
+            # 1. 滤波与重采样
             clean_raw = clean_ecg_signal(raw_ecg, fs=360)
             ecg = signal.resample_poly(clean_raw, TARGET_FS, 360)
             
             # 2. 全局标准化
             ecg_global_norm = (ecg - np.mean(ecg)) / (np.std(ecg) + 1e-8)
             
-            # 3. 注释时间轴对齐 (360Hz 映射至 250Hz)
+            # 3. 注释时间轴对齐 (360Hz 映射至 250Hz) 并映射分类
             anno_idx = np.round(annotation.sample * (TARGET_FS / 360)).astype(int)
-            # 筛选出所有非正常心律的异常点索引
-            risk_idx = anno_idx[~np.isin(np.array(annotation.symbol), ['N', '.', '/'])]
-
+            anno_classes = np.array([get_class_from_annotation(sym, aux) for sym, aux in zip(annotation.symbol, annotation.aux_note)])
+            
             # 4. 滑动窗口切片提取
             for start in range(0, len(ecg_global_norm) - HISTORY_PTS - PREDICT_PTS, STRIDE_SEC * TARGET_FS):
                 predict_start = start + HISTORY_PTS
                 predict_end = predict_start + PREDICT_PTS
                 
-                # 统计未来预测窗口内的异常点命中数
-                risk_hits = np.sum((risk_idx >= predict_start) & (risk_idx < predict_end))
+                window_mask = (anno_idx >= predict_start) & (anno_idx < predict_end)
+                window_classes = anno_classes[window_mask]
                 
-                # 提取过去 10 分钟的数据，重塑为网络所需的 [300步, 1通道, 500点]
+                # 定性逻辑：寻找窗口内的最高危标签
+                priority_map = {3: 6, 4: 5, 2: 4, 5: 3, 1: 2, 0: 1}
+                target_class = 0
+                highest_priority = 0
+                
+                if len(window_classes) > 0:
+                    class_counts = {c: np.sum(window_classes == c) for c in set(window_classes)}
+                    for cls, count in class_counts.items():
+                        # 恶性节律只需出现即报警，PVC需达到频发阈值
+                        if (cls in [2, 3, 4, 5] and count >= 1) or (cls == 1 and count >= risk_threshold) or (cls == 0):
+                            if priority_map[cls] > highest_priority:
+                                highest_priority = priority_map[cls]
+                                target_class = cls
+                
                 x_norm = ecg_global_norm[start : predict_start]
                 sample = x_norm.reshape(300, 1, 500)
                 
-                if risk_hits >= risk_threshold:
-                    X_risk.append(sample)
-                else:
-                    X_normal.append(sample)
+                X_multi.append(sample)
+                
+                # 标签平滑 (Label Smoothing) for 6 classes
+                smoothed_label = [0.02] * 6
+                smoothed_label[target_class] = 0.90
+                Y_multi.append(smoothed_label)
+                
         except Exception:
             continue
-
-    # 5. 1:1 绝对平衡欠采样
-    num_samples = min(len(X_normal), len(X_risk))
-    X_final = random.sample(X_normal, num_samples) + random.sample(X_risk, num_samples)
-    
-    # 6. 标签平滑 (Label Smoothing) - 降低模型过度自信，提供容错死区
-    Y_final = [0.05] * num_samples + [0.95] * num_samples 
-
-    combined = list(zip(X_final, Y_final))
+            
+    # 打乱并保存 (为多分类保持精简，省略了重采样逻辑，直接保存全量切片)
+    combined = list(zip(X_multi, Y_multi))
     random.shuffle(combined)
-    X_final, Y_final = zip(*combined)
-
-    if X_final:
+    X_multi, Y_multi = zip(*combined)
+    
+    if X_multi:
         save_path = os.path.join(SAVE_DIR, f'{name}.pt')
-        torch.save({'X': torch.tensor(np.array(X_final), dtype=torch.float32), 
-                    'Y': torch.tensor(np.array(Y_final), dtype=torch.float32).unsqueeze(1)},
-                   save_path)
-        pbar.write(f"📊 已生成 {name} -> 样本量: {len(X_final)} (正负样本比 1:1)")
+        torch.save({'X': torch.tensor(np.array(X_multi), dtype=torch.float32), 
+                    'Y': torch.tensor(np.array(Y_multi), dtype=torch.float32)}, save_path)
+        pbar.write(f"📊 已生成 {name} -> 样本量: {len(X_multi)}")
+# ==========================================
+# 模块 5：执行控制流 
+# ==========================================
 
-# ==========================================
-# 模块 5：执行控制流
-# ==========================================
 if __name__ == '__main__':
-    demo_cases = ['100', '119', '201', '208', '233']
+    # 替换为前端正在使用的全新多分类经典病案
+    demo_cases = ['100', '119', '201', '207', '209'] 
+    
     all_recs = sorted(list(set([f.split('.')[0] for f in os.listdir(DATA_DIR) if f.endswith('.dat')])))
-    # 剔除演示集与已知质量极差的病例，构建纯净训练集
+    
+    # 严格在训练集中剔除前端演示用的病例，防止数据泄露 (Data Leakage)
     train_recs = [r for r in all_recs if r not in (demo_cases + ['102', '104', '107', '217'])]
-
+    
     build_balanced_dataset(train_recs, 'train_massive_v5')
     build_balanced_dataset(demo_cases, 'val_demo_v5')

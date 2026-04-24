@@ -111,13 +111,13 @@ class HybridWarningNet(nn.Module):
         self.rhythm_pool = nn.AvgPool1d(kernel_size=25, stride=25) 
         self.rhythm_linear = nn.Linear(20, 8) 
 
-        # --- 5. 最终决策分类头 ---
+        # --- 5. 最终决策分类头 (多分类重构) ---
         # 输入维度 = 64 (主干时序) + 8 (节律分支) = 72
         self.warning_head = nn.Sequential(
             nn.Dropout(0.5),
             nn.Linear(72, 16),
             nn.ReLU(),
-            nn.Linear(16, 1) 
+            nn.Linear(16, 6) # 输出6个类别
         )
 
     def forward(self, x):
@@ -163,9 +163,14 @@ class HybridWarningNet(nn.Module):
         # 归一化至 [0, 1] 区间以便前端渲染背景色深度
         cam_1d = cam_1d / (cam_1d.max(dim=1, keepdim=True)[0] + 1e-8)
 
+        # --- 步骤 6: 实时生成 1D-CAM 可解释热力图 ---
+        cam_weights = self.warning_head[1].weight[:, :64].mean(dim=0)
+        cam_1d = torch.relu(torch.sum(cam_weights.view(1, 64, 1) * global_skip, dim=1))
+        cam_1d = cam_1d / (cam_1d.max(dim=1, keepdim=True)[0] + 1e-8)
+        
         return {
-            "logits": logits,                  # 训练用
-            "prob": torch.sigmoid(logits),     # 业务预警用
-            "cam": cam_1d,                     # 解释性前端渲染用 (长度 300)
-            "attn": attn_weights.squeeze(1)    # 权重分析用
+            "logits": logits,                             # 训练用
+            "prob": torch.softmax(logits, dim=1),         # 业务预警用：多分类概率
+            "cam": cam_1d,                                # 解释性前端渲染用 (长度 300)
+            "attn": attn_weights.squeeze(1)               # 权重分析用
         }
