@@ -1,23 +1,17 @@
 ﻿"""
-模块名称：多模态混合时序预警网络 (Hybrid Warning Network V3.0)
-模块功能：
-    1. 局部特征提取：利用 1D-CNN 捕获瞬时心电形态畸变。
-    2. 全局时序建模：利用 TCN (时序卷积网络) 捕捉 10 分钟长程演变，并支持全局跳跃连接 (Global Skip)。
-    3. 稀疏时序注意力：利用 Sigmoid 激活的注意力机制准确定位病灶瞬间。
-    4. 临床节律感知：专门设计的能量包络提取分支，增强对节律失常（如房颤、早搏间期）的感知。
-    5. 可解释性支持：内置 1D-CAM 计算，支持 ONNX 导出，实时输出病灶热力图。
+HealthMonitor V3.0 - 深度学习网络模型主体架构
+功能描述：网络聚合了时间序列因果约束、感受野扩大、形态特征与长程规律并行提取得架构体系。
 """
 
 import torch
 import torch.nn as nn
 from torch.nn.utils import weight_norm
 
-# ==========================================
-# 基础时序组件
-# ==========================================
-
 class Chomp1d(nn.Module):
-    """裁剪模块：移除卷积产生的对称 Padding，确保时序因果性"""
+    """
+    因果裁剪组件：
+    在使用特征填充（Padding）的情况下保障 TCN 节点无法触及未来时序上的特征信息。
+    """
     def __init__(self, chomp_size):
         super(Chomp1d, self).__init__()
         self.chomp_size = chomp_size
@@ -27,49 +21,50 @@ class Chomp1d(nn.Module):
 
 class TemporalBlock(nn.Module):
     """
-    改进型时序卷积块：
-    同时返回主路径输出 (Main Path) 和 跳跃连接输出 (Skip Connection)。
+    带旁路透传设计的扩张因果卷积块 (Dilated Causal Convolution)
+    功能：内部实现双层残差结构，并对外抛出主干和跳跃连接(Skip Connection)两股数据流。
     """
     def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, padding, dropout=0.2):
         super(TemporalBlock, self).__init__()
+        
         self.conv1 = weight_norm(nn.Conv1d(n_inputs, n_outputs, kernel_size,
                                            stride=stride, padding=padding, dilation=dilation))
         self.chomp1 = Chomp1d(padding)
+        self.bn1 = nn.BatchNorm1d(n_outputs)  # <--- 【减震器 1】
         self.relu1 = nn.ReLU()
         self.dropout1 = nn.Dropout(dropout)
 
         self.conv2 = weight_norm(nn.Conv1d(n_outputs, n_outputs, kernel_size,
                                            stride=stride, padding=padding, dilation=dilation))
         self.chomp2 = Chomp1d(padding)
+        self.bn2 = nn.BatchNorm1d(n_outputs)  # <--- 【减震器 2】
         self.relu2 = nn.ReLU()
         self.dropout2 = nn.Dropout(dropout)
 
-        self.net = nn.Sequential(self.conv1, self.chomp1, self.relu1, self.dropout1,
-                                 self.conv2, self.chomp2, self.relu2, self.dropout2)
+        # 把 bn1 和 bn2 组装进执行链路中（紧跟在 chomp 之后，relu 之前）
+        self.net = nn.Sequential(self.conv1, self.chomp1, self.bn1, self.relu1, self.dropout1,
+                                 self.conv2, self.chomp2, self.bn2, self.relu2, self.dropout2)
+        
+        # 残差对齐映射通道
         self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
         self.relu = nn.ReLU()
 
     def forward(self, x):
-        # 计算主路径输出
         out = self.net(x)
         res = x if self.downsample is None else self.downsample(x)
         main_out = self.relu(out + res)
-        
-        # 提取跳跃连接特征 (Skip Output)
-        # 物理意义：当前层新提取出的、未经过残差叠加的“纯净”特征模式
-        skip_out = out 
-        
+        skip_out = out
         return main_out, skip_out
 
-# ==========================================
-# 核心预警网络架构
-# ==========================================
-
 class HybridWarningNet(nn.Module):
+    """
+    多模态时序聚合网络骨架。
+    集成了 CNN 特征分支、长程 TCN 主干，并且引出了线性的1D类激活映射(CAM)。
+    """
     def __init__(self, in_channels=1):
         super().__init__()
         
-        # --- 1. 局部形态特征流 (1D-CNN) ---
+        # 形态提取段，聚焦极微观的QRS等波群
         self.cnn_extractor = nn.Sequential(
             nn.Conv1d(in_channels, 16, kernel_size=15, padding=7),
             nn.BatchNorm1d(16),
@@ -78,8 +73,8 @@ class HybridWarningNet(nn.Module):
         )
         self.max_pool = nn.AdaptiveMaxPool1d(1)
         self.avg_pool = nn.AdaptiveAvgPool1d(1)
-
-        # --- 2. 时序演变建模流 (TCN) ---
+        
+        # 长时序关联段，扩大捕捉区间范围
         num_channels = [32, 64, 64]
         kernel_size = 3
         layers = []
@@ -87,90 +82,67 @@ class HybridWarningNet(nn.Module):
         for i in range(len(num_channels)):
             dilation_size = 2 ** i
             out_ch = num_channels[i]
-            layers.append(TemporalBlock(in_ch, out_ch, kernel_size, stride=1, 
-                                        dilation=dilation_size, padding=(kernel_size-1) * dilation_size))
+            layers.append(TemporalBlock(
+                in_ch, out_ch, kernel_size, stride=1, dilation=dilation_size, padding=(kernel_size-1) * dilation_size
+            ))
             in_ch = out_ch
         self.tcn_blocks = nn.ModuleList(layers)
-
-        # 适配器：将不同深度的 TCN 跳跃输出统一至 64 通道
+        
         self.skip_adapters = nn.ModuleList([
             nn.Conv1d(32, 64, 1),
             nn.Conv1d(64, 64, 1)
         ])
-
-        # --- 3. 稀疏时序注意力模块 ---
+        
+        # 注意力层用以在长距离上赋予不同病灶权重分布
         self.temporal_attn = nn.Sequential(
             nn.Conv1d(64, 16, kernel_size=1),
             nn.ReLU(),
             nn.Conv1d(16, 1, kernel_size=1),
-            nn.Sigmoid() 
+            nn.Sigmoid()
         )
-
-        # --- 4. 临床节律感知分支 (能量包络提取) ---
-        # 捕捉 RR 间期变化，模拟希尔伯特变换的包络检波能力
-        self.rhythm_pool = nn.AvgPool1d(kernel_size=25, stride=25) 
-        self.rhythm_linear = nn.Linear(20, 8) 
-
-        # --- 5. 最终决策分类头 (多分类重构) ---
-        # 输入维度 = 64 (主干时序) + 8 (节律分支) = 72
+        
+        # 辅佐的节律物理池化通道
+        self.rhythm_pool = nn.AvgPool1d(kernel_size=25, stride=25)
+        self.rhythm_linear = nn.Linear(20, 8)
+        
+        # 汇总决策归类器
         self.warning_head = nn.Sequential(
             nn.Dropout(0.5),
             nn.Linear(72, 16),
             nn.ReLU(),
-            nn.Linear(16, 6) # 输出6个类别
+            nn.Linear(16, 6)
         )
 
     def forward(self, x):
         batch_size, seq_len, channels, points = x.size()
         c_in = x.view(batch_size * seq_len, channels, points)
-
-        # --- 步骤 1: 提取局部窗口特征 ---
+        
         cnn_features = self.cnn_extractor(c_in)
-        max_feats = self.max_pool(cnn_features).squeeze(-1)
-        avg_feats = self.avg_pool(cnn_features).squeeze(-1)
-        c_out = torch.cat([max_feats, avg_feats], dim=1) 
-
-        # --- 步骤 2: 全局时序卷积与跳跃连接汇总 ---
+        c_out = torch.cat([self.max_pool(cnn_features).squeeze(-1), self.avg_pool(cnn_features).squeeze(-1)], dim=1)
+        
         t_in = c_out.view(batch_size, seq_len, 32).transpose(1, 2)
         global_skip = 0
         for i, block in enumerate(self.tcn_blocks):
-            # 🟢 关键：现在 TemporalBlock 会返回两个张量
             t_in, skip_out = block(t_in)
-            if i < len(self.skip_adapters):
-                global_skip += self.skip_adapters[i](skip_out)
-            else:
-                global_skip += skip_out 
-
-        # --- 步骤 3: 计算注意力权重并执行加权池化 ---
+            global_skip += self.skip_adapters[i](skip_out) if i < len(self.skip_adapters) else skip_out
+            
         attn_weights = self.temporal_attn(global_skip)
         weighted_feat = torch.sum(global_skip * attn_weights, dim=2) / (attn_weights.sum(dim=2) + 1e-4)
-
-        # --- 步骤 4: 计算原始信号的能量包络 (节律感知) ---
-        # 使用 torch.abs(c_in) 代替非标准 nn.Abs()
-        envelope = self.rhythm_pool(torch.abs(c_in)) 
-        envelope = envelope.view(batch_size * seq_len, -1)
-        rhythm_feat = self.rhythm_linear(envelope)
-        rhythm_feat = rhythm_feat.view(batch_size, seq_len, 8).mean(dim=1) 
-
-        # --- 步骤 5: 特征融合与 Logits 输出 ---
-        combined_feat = torch.cat([weighted_feat, rhythm_feat], dim=1) 
+        
+        envelope = self.rhythm_pool(torch.abs(c_in)).view(batch_size * seq_len, -1)
+        rhythm_feat = self.rhythm_linear(envelope).view(batch_size, seq_len, 8).mean(dim=1)
+        
+        combined_feat = torch.cat([weighted_feat, rhythm_feat], dim=1)
         logits = self.warning_head(combined_feat)
-
-        # --- 步骤 6: 实时生成 1D-CAM 可解释热力图 ---
-        # 修正：切片提取 warning_head 中对应 TCN 通道的前 64 维权重
-        cam_weights = self.warning_head[1].weight[:, :64].mean(dim=0)
-        cam_1d = torch.relu(torch.sum(cam_weights.view(1, 64, 1) * global_skip, dim=1))
-        # 归一化至 [0, 1] 区间以便前端渲染背景色深度
-        cam_1d = cam_1d / (cam_1d.max(dim=1, keepdim=True)[0] + 1e-8)
-
-        # --- 步骤 6: 实时生成 1D-CAM 可解释热力图 ---
+        
+        # 输出线性权重映射特征矩阵(1D-CAM热力图用)
         cam_weights = self.warning_head[1].weight[:, :64].mean(dim=0)
         cam_1d = torch.relu(torch.sum(cam_weights.view(1, 64, 1) * global_skip, dim=1))
         cam_1d = cam_1d / (cam_1d.max(dim=1, keepdim=True)[0] + 1e-8)
         
         return {
-            "logits": logits,                             # 训练用
-            "prob": torch.softmax(logits, dim=1),         # 业务预警用：多分类概率
-            "cam": cam_1d,                                # 解释性前端渲染用 (长度 300)
-            "attn": attn_weights.squeeze(1)               # 权重分析用
+            "logits": logits,
+            "prob": torch.softmax(logits, dim=1),
+            "cam": cam_1d,
+            "attn": attn_weights.squeeze(1)
         }
