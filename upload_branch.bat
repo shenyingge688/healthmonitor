@@ -7,7 +7,7 @@ git checkout -b 3.5
 :: 索引目前文件夹下的全部迭代改动并置入缓存区
 git add .
 :: 为此一次独立升级标注整体版本的自述明细摘要
-git commit -m "feat: new data v3.5"
+git commit -m "feat: new data v3.51"
 :: 新增指针跟踪节点并正式将游离网络压栈部署到云存储远端
 git push -u origin 3.5
 echo.
