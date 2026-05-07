@@ -1,7 +1,6 @@
 ﻿"""
 HealthMonitor V3.0 - 性能测试与混淆矩阵校验脚本
 """
-
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 from dl_model import HybridWarningNet
@@ -45,11 +44,14 @@ labels_idx = [0, 1, 2, 3, 4, 5]
 clf_report = classification_report(all_targets, all_preds, labels=labels_idx, target_names=CLASS_NAMES, zero_division=0)
 conf_matrix = confusion_matrix(all_targets, all_preds, labels=labels_idx)
 
+# 【修复】使用 len(test_loader) (批次总数) 代替 len(all_preds) (样本总数)
+true_batch_time_ms = duration / max(1, len(test_loader)) * 1000
+
 print(f"""
 ======================================================
 🏥 预警引擎框架预测综合性能呈现
 ======================================================
-* 平均时延核算: {duration/max(1, len(all_preds))*1000:.3f} ms/每批次
+* 平均时延核算: {true_batch_time_ms:.3f} ms/每批次 (Batch Size: 32)
 ------------------------------------------------------
 【详细指标呈现表】
 {clf_report}
