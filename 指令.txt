@@ -8,8 +8,10 @@ py -m uvicorn main:app --reload
 py build_dataset_factory.py
 训练模型
 py train_massive_v5.py
+py train_trajectory.py
 检验脚本
 py validation_multiclass.py
+py evaluate_clinical_metrics.py
 上传
 .\upload.bat
 .\upload_branch.bat

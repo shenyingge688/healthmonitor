@@ -1,99 +1,67 @@
 ﻿"""
-HealthMonitor V3.0 - FastAPI 推断网关
+临床推断网关
+包含: 异构联合推断 | MC Dropout 认知不确定性评估
 """
-import sys
 import torch
 import numpy as np
-from fastapi import FastAPI, Header, HTTPException
-from dl_model import HybridWarningNet
-from collections import deque
-from cachetools import TTLCache # 【修复】导入 TTL 缓存防内存泄漏
+from fastapi import FastAPI, HTTPException
+from dl_model import LatentDynamicsForecastingNet
 
-app = FastAPI(title="HealthMonitor Inference Engine")
+app = FastAPI(title="PTFN Clinical Inference Gateway")
+model = LatentDynamicsForecastingNet()
+model.eval()
 
-class MultiClassRiskManager:
-    def __init__(self, window_size=5):
-        self.window_size = window_size
-        self.history = deque(
-            [np.array([1.0/6.0]*6) for _ in range(window_size)], 
-            maxlen=window_size
-        )
+def enable_dropout(m):
+    if type(m) == torch.nn.Dropout: m.train()
 
-    def reset(self):
-        self.history.clear()
-        for _ in range(self.window_size):
-            self.history.append(np.array([1.0/6.0]*6))
-
-    def smooth_probabilities(self, current_probs):
-        self.history.append(np.array(current_probs))
-        avg_probs = np.mean(list(self.history), axis=0)
-        smoothed_top1_class = int(np.argmax(avg_probs))
-        smoothed_top1_prob = float(avg_probs[smoothed_top1_class])
-        return smoothed_top1_class, smoothed_top1_prob, avg_probs.tolist()
-
-# 【修复】使用 TTLCache：最大追踪1000个设备，若设备10分钟（600秒）未发送请求则自动销毁状态
-risk_managers: TTLCache = TTLCache(maxsize=1000, ttl=600)
-
-def get_risk_manager(device_id: str) -> MultiClassRiskManager:
-    if device_id not in risk_managers:
-        risk_managers[device_id] = MultiClassRiskManager(window_size=5)
-    return risk_managers[device_id]
-
-model = HybridWarningNet()
-
-try:
-    model.load_state_dict(
-        torch.load('models/hybrid_v5_massive_best.pth', map_location='cpu', weights_only=True)
-    )
-    model.eval()
-    print("✅ 多分类推断引擎装载完毕，正在监听...")
-except Exception as e:
-    print(f"❌ 致命错误：核心权重装载失败，已切断服务。原因: {e}")
-    sys.exit(1)
-
-@app.post("/api/predict")
-def predict_future(data: dict, device_id: str = Header("default-device", alias="X-Device-ID")):
+@app.post("/api/predict_trajectory")
+def predict_trajectory(data: dict):
     ecg_clean = np.array(data.get('ecg', []))
-    TARGET_LEN = 150000
-
-    if len(ecg_clean) == 0 or np.isnan(ecg_clean).any() or np.isinf(ecg_clean).any():
-        raise HTTPException(status_code=400, detail="检测到无效的心电数据")
+    TARGET_FS = 250
+    HISTORY_SEC = 300 
+    TARGET_LEN = HISTORY_SEC * TARGET_FS 
 
     if len(ecg_clean) != TARGET_LEN:
-        if len(ecg_clean) < TARGET_LEN:
-            ecg_clean = np.pad(ecg_clean, (0, TARGET_LEN - len(ecg_clean)), 'constant')
-        else:
-            ecg_clean = ecg_clean[-TARGET_LEN:]
-
-    if np.std(ecg_clean) < 1e-8:
-        raise HTTPException(status_code=400, detail="信号方差过低，疑似导联脱落")
+        raise HTTPException(status_code=400, detail="需完整的 5 分钟基准切片")
 
     ecg_norm = (ecg_clean - np.mean(ecg_clean)) / (np.std(ecg_clean) + 1e-8)
-    input_tensor = torch.tensor(ecg_norm.reshape(1, 300, 1, 500), dtype=torch.float32)
-
-    with torch.no_grad():
-        outputs = model(input_tensor)
-
-    probs = outputs["prob"][0].cpu().numpy()
-    cam_array = outputs["cam"].cpu().numpy().flatten().tolist()
     
-    local_manager = get_risk_manager(device_id)
-    final_class, final_prob, final_all_probs = local_manager.smooth_probabilities(probs)
+    # 动态构建重叠窗口
+    WINDOW_SEC, STRIDE_SEC = 30, 15
+    pts_per_win = WINDOW_SEC * TARGET_FS
+    stride_pts = STRIDE_SEC * TARGET_FS
+    n_windows = (TARGET_LEN - pts_per_win) // stride_pts + 1
+    
+    seq_data = [ecg_norm[i*stride_pts : i*stride_pts + pts_per_win] for i in range(n_windows)]
+    input_tensor = torch.tensor(np.array(seq_data).reshape(n_windows, 1, pts_per_win), dtype=torch.float32).unsqueeze(0)
+
+    # 预测意图：查询 5 分钟视界
+    h_idx_5m = torch.tensor([2], dtype=torch.long)
+
+    # 启用 MC Dropout 估计不确定性
+    model.apply(enable_dropout) 
+    mc_vt_hazards = []
+    
+    with torch.no_grad():
+        for _ in range(20):
+            out = model(input_tensor, h_idx_5m)
+            # 使用 Sigmoid 激活 Hazard Logits
+            mc_vt_hazards.append(torch.sigmoid(out["preds"]["vt_hazard_logits"])[0].item())
+            
+    mean_hazard = np.mean(mc_vt_hazards)
+    uncertainty = np.std(mc_vt_hazards)
+    
+    # 提取无 Dropout 的归因权重
+    model.eval()
+    with torch.no_grad():
+        clean_out = model(input_tensor, h_idx_5m)
+        attn_weights = clean_out["attention"][0].tolist()
 
     return {
-        "pred_class": final_class,
-        "future_risk_prob": final_prob,
-        "all_probs": final_all_probs,
-        "cam_heatmap": cam_array
+        "future_5m_prediction": {
+            "vt_hazard_prob": float(mean_hazard),
+            "epistemic_uncertainty": float(uncertainty),
+            "is_reliable": uncertainty < 0.15 
+        },
+        "clinical_attribution_signals": attn_weights
     }
-
-@app.post("/api/reset/{device_id}")
-def reset_risk_manager(device_id: str):
-    if device_id in risk_managers:
-        risk_managers[device_id].reset()
-        return {"status": "ok", "message": f"Session {device_id} reset."}
-    return {"status": "ok", "message": f"No active session for {device_id}."}
-
-@app.get("/api/health")
-def health_check():
-    return {"status": "healthy", "active_sessions": len(risk_managers)}
