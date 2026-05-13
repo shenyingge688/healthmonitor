@@ -1,5 +1,7 @@
 ﻿"""
-核心机制: Time-Block Split | WFDB Rhythm Occupancy 解析 | Prediction Gap
+Script: build_dataset_factory.py
+Version: V8.0 (Survival Data Factory)
+核心机制: Time-Block Split | WFDB Rhythm Occupancy | Discrete-Time Survival Labels
 """
 import wfdb
 import numpy as np
@@ -55,8 +57,10 @@ def parse_wfdb_semantics(annotation, target_fs, total_pts):
     beat_idx = np.array([b[0] for b in beat_annotations]) if beat_annotations else np.array([])
     return rhythm_timeline, beat_idx
 
-def extract_structured_labels(rhythm_timeline, beat_idx, window_start, window_end):
-    """提取结构化预测目标"""
+def extract_structured_labels(rhythm_timeline, beat_idx, window_start, window_end, target_fs):
+    """
+    提取结构化预测目标 (V8.0 离散生存升维重构)
+    """
     # 1. PVC Count (Burden)
     if len(beat_idx) > 0:
         pvc_count = np.sum((beat_idx >= window_start) & (beat_idx < window_end))
@@ -68,10 +72,27 @@ def extract_structured_labels(rhythm_timeline, beat_idx, window_start, window_en
     afib_pts = np.sum(rhythm_timeline[window_start:window_end] == 2)
     afib_occupancy = afib_pts / max(1, window_pts)
     
-    # 3. VT/VF Hazard Onset
-    vt_vf_onset = 1.0 if np.any(rhythm_timeline[window_start:window_end] == 4) else 0.0
+    # 3. VT/VF 离散生存标签 (Discrete-Time Hazard 3-Bin Array)
+    future_rhythm = rhythm_timeline[window_start:window_end]
+    vt_indices = np.where(future_rhythm == 4)[0]
     
-    return [float(pvc_count), float(afib_occupancy), float(vt_vf_onset)]
+    if len(vt_indices) == 0:
+        # 平安无事，全过程存活
+        vt_survival_label = [0.0, 0.0, 0.0]
+    else:
+        # 找到第一次爆发的时间 (距离预测起始点的秒数)
+        first_vt_idx = vt_indices[0]
+        time_to_vt_seconds = first_vt_idx / target_fs
+        
+        # 根据爆发时间分配 Bin，并用 -1 掩蔽掉发作后的区间 (因为后续不再有生存意义)
+        if time_to_vt_seconds <= 30.0:
+            vt_survival_label = [1.0, -1.0, -1.0] # 极短期崩溃
+        elif time_to_vt_seconds <= 120.0:
+            vt_survival_label = [0.0, 1.0, -1.0]  # 短期恶化
+        else:
+            vt_survival_label = [0.0, 0.0, 1.0]   # 中期持续退化
+    
+    return [float(pvc_count), float(afib_occupancy), vt_survival_label]
 
 def build_clinical_trajectory_dataset(record_list, name, timeline_mode='train', save_dir='./dataset'):
     os.makedirs(save_dir, exist_ok=True)
@@ -95,6 +116,7 @@ def build_clinical_trajectory_dataset(record_list, name, timeline_mode='train', 
             else: 
                 search_start, search_end = 0, total_len
                 
+            # [V8.0 防护线]: 硬截断防右删失。只保留拥有完整未来(300秒)的切片
             max_start = search_end - (HISTORY_SEC + GAP_SEC + 300) * TARGET_FS
             if max_start <= search_start: continue
             
@@ -111,14 +133,15 @@ def build_clinical_trajectory_dataset(record_list, name, timeline_mode='train', 
                     x_norm = (x_raw - np.mean(x_raw)) / (np.std(x_raw) + 1e-8)
                     seq_data.append(x_norm.astype(np.float32))
                 
-                # 针对不同视界抽取标签 (此处仅以 5m 为例演示数据保存)
-                # 实际中你可以生成三组 labels
+                # 针对 5m 视界抽取标签
                 mask_5m_end = gap_end_idx + 300 * TARGET_FS
-                labels_5m = extract_structured_labels(rhythm_timeline, beat_idx, gap_end_idx, mask_5m_end)
+                labels_5m = extract_structured_labels(rhythm_timeline, beat_idx, gap_end_idx, mask_5m_end, TARGET_FS)
                 
                 X_seq_all.append(np.array(seq_data).reshape(N_WINDOWS, 1, PTS_PER_WIN))
                 Y_pvc_all.append(labels_5m[0])
                 Y_afib_all.append(labels_5m[1])
+                
+                # V8.0: 这里 append 的是一个长度为 3 的 list [h1, h2, h3]
                 Y_vt_all.append(labels_5m[2])
                 
         except Exception:
@@ -130,6 +153,7 @@ def build_clinical_trajectory_dataset(record_list, name, timeline_mode='train', 
         'X': torch.tensor(np.array(X_seq_all), dtype=torch.float32),
         'Y_pvc': torch.tensor(Y_pvc_all, dtype=torch.float32),
         'Y_afib': torch.tensor(Y_afib_all, dtype=torch.float32),
+        # V8.0: 转化为张量后，Y_vt 的 shape 将完美变为 [Batch, 3]
         'Y_vt': torch.tensor(Y_vt_all, dtype=torch.float32)
     }, os.path.join(save_dir, f'{name}_{timeline_mode}.pt'))
     print(f"✅ 生成完毕 (总数: {len(X_seq_all)})")
