@@ -1,6 +1,6 @@
 ﻿"""
 Script: dashboard.py
-Version: V10.1 (Objective Clinical UI - BugFix & Bilingual Labels)
+Version: V10.1 (Objective Clinical UI - Async Streaming)
 """
 import streamlit as st
 import requests
@@ -17,6 +17,10 @@ st.set_page_config(page_title="临床动力学终端", layout="wide")
 
 if 'anomaly_logs' not in st.session_state:
     st.session_state.anomaly_logs = []
+if 'is_streaming' not in st.session_state:
+    st.session_state.is_streaming = False
+if 'api_session' not in st.session_state:
+    st.session_state.api_session = requests.Session()
 
 # ==========================================
 # 侧边栏与数据加载
@@ -33,6 +37,13 @@ clinical_cases = {
 
 selected_id = st.sidebar.selectbox("选择监测源", options=list(clinical_cases.keys()), format_func=lambda x: clinical_cases[x]["bed_label"])
 start_mins = st.sidebar.slider("设定起始点 (分钟)", 0.0, 15.0, 10.0, 0.1)
+
+# 🚀 替换为可控状态的按钮
+col_btn1, col_btn2 = st.sidebar.columns(2)
+if col_btn1.button("🔴 启动数据推流", use_container_width=True):
+    st.session_state.is_streaming = True
+if col_btn2.button("⏹️ 停止数据推流", use_container_width=True):
+    st.session_state.is_streaming = False
 
 if st.sidebar.button("🗑️ 清空追踪日志", use_container_width=True):
     st.session_state.anomaly_logs = []
@@ -63,7 +74,7 @@ st.title(f"📊 动态推演分析终端 - {clinical_cases[selected_id]['bed_lab
 st.info(f"**【病史/体征】** {clinical_cases[selected_id]['desc']}")
 
 warning_box = st.empty()
-api_status_box = st.empty() # 🚀 新增：API 状态报警器
+api_status_box = st.empty() 
 
 col1, col2 = st.columns([3, 1])
 with col1:
@@ -81,7 +92,6 @@ st.divider()
 st.subheader("📑 并发事件日志")
 log_placeholder = st.empty()
 
-# 辅助函数：调整了 label 宽度以容纳双语
 def build_prob_column_html(title, prob_list):
     html = f"<div style='flex: 1; min-width: 260px; margin-right: 15px;'>"
     html += f"<p style='margin:0 0 10px 0; font-weight: 600; color: #A0AEC0; font-size: 13px;'>{title}</p>"
@@ -93,7 +103,6 @@ def build_prob_column_html(title, prob_list):
         font_w = "600" if p_val > 0.05 else "400"
         
         html += f"<div style='display:flex; align-items:center; margin-bottom:6px; color:{text_c}; font-size: 12px;'>"
-        # 🚀 宽度增加到 130px，完整展示中英双语
         html += f"<span style='width:130px; font-weight:{font_w}; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;'>{item['label']}</span>"
         html += f"<div style='flex-grow:1; background:rgba(0,0,0,0.3); height:6px; margin:0 10px; border-radius:3px; overflow:hidden;'>"
         html += f"<div style='width:{w}%; background:{c}; height:100%; border-radius:3px; transition: width 0.3s ease;'></div>"
@@ -103,22 +112,24 @@ def build_prob_column_html(title, prob_list):
     html += "</div>"
     return html
 
-if st.sidebar.button("🔴 启动数据推流", use_container_width=True):
+# 使用状态标志位控制循环
+if st.session_state.is_streaming:
     sim_step = 0
     base_offset_pts = int(start_mins * 60 * 250)
     ecg_buffer = np.full(1000, np.nan)
     display_len, step_size, refresh_rate = 1000, 20, 0.08  
     
-    # 🚀 核心修复 1：把变量提升到全局循环外，防止 API 失败时产生幻觉
     rhythm_data = [1.0, 0.0, 0.0, 0.0]
     crit_data = [1.0, 0.0, 0.0, 0.0]
     hazard_data = [0.0, 0.0, 0.0]
     last_risk, last_trajectory = 0.0, [0.0] * 10
     cached_warning_html = ""
 
-    while True:
+    while st.session_state.is_streaming:
         current_pts = base_offset_pts + (sim_step * step_size)
-        if current_pts >= len(data_source) - 1: break
+        if current_pts >= len(data_source) - 1: 
+            st.session_state.is_streaming = False
+            break
 
         new_data = data_source[current_pts - step_size : current_pts]
         idx = (sim_step * step_size) % display_len
@@ -143,12 +154,12 @@ if st.sidebar.button("🔴 启动数据推流", use_container_width=True):
             if len(full_win) < 150000: full_win = np.pad(full_win, (150000 - len(full_win), 0), 'constant')
             
             try:
-                resp = requests.post("http://127.0.0.1:8000/api/predict", json={"ecg": full_win.tolist()}, timeout=3)
+                # 🚀 替换为 Session 连接池，减少建立 TCP 的握手开销避免前端卡顿
+                resp = st.session_state.api_session.post("http://127.0.0.1:8000/api/predict", json={"ecg": full_win.tolist()}, timeout=3)
                 if resp.status_code == 200:
-                    api_status_box.empty() # 清除报错
+                    api_status_box.empty() 
                     data = resp.json()
                     
-                    # 🚀 核心修复 2：严格判断后端返回的数据格式，防止因后端没更新导致静默报错
                     if 'rhythm' in data:
                         rhythm_data = data.get('rhythm')
                         crit_data = data.get('criticality')
@@ -156,7 +167,6 @@ if st.sidebar.button("🔴 启动数据推流", use_container_width=True):
                         last_risk = hazard_data[-1] 
                         new_traj = data.get('risk_trajectory', [])
                     else:
-                        # 兼容老版 API 强行解析
                         api_status_box.warning("⚠️ 检测到旧版 FastAPI 响应格式。请更新 backend 以获得完整三维输出！")
                         rhythm_data = [data.get('normal_prob', 1.0), data.get('pvc_prob', 0.0), data.get('afib_prob', 0.0), 0.0]
                         crit_data = [1.0 - data.get('vt_risk_5m', 0.0), 0.0, data.get('vt_risk_5m', 0.0), 0.0]
@@ -182,14 +192,10 @@ if st.sidebar.button("🔴 启动数据推流", use_container_width=True):
                 else:
                     api_status_box.error(f"❌ 引擎连接异常 (Status Code: {resp.status_code})")
             except Exception as e:
-                # 🚀 不再屏蔽报错，大声告诉前端出错了
                 api_status_box.error(f"❌ 推理引擎断开连接: {e}")
         
         metric_risk.metric("5分钟恶化概率", f"{last_risk * 100:.1f}%")
 
-        # ==========================================
-        # 🚀 升级：三维临床双语标签
-        # ==========================================
         rhy_list = [
             {"label": "正常稳态 (Normal)", "prob": rhythm_data[0], "color": "#10B981"},
             {"label": "室早负荷 (PVC)", "prob": rhythm_data[1], "color": "#F59E0B"},
@@ -210,7 +216,6 @@ if st.sidebar.button("🔴 启动数据推流", use_container_width=True):
             {"label": "5分钟 崩溃预警", "prob": hazard_data[2], "color": "#DC2626"}
         ]
 
-        # 临床表述逻辑提取
         cri_list_sorted = sorted(cri_list, key=lambda x: x['prob'], reverse=True)
         primary_cri = cri_list_sorted[0]
         for item in cri_list_sorted:
