@@ -1,155 +1,110 @@
 ﻿"""
 Script: evaluate_clinical_metrics.py
-Version: V8.0 Final (Discrete Survival & Causal Ablation)
-Description: 
-临床决策综合评估中心。
-执行真实的物理隔离验证，应用 Isotonic Regression 概率校准，
-模拟 ICU 真实报警疲劳 (Alarm Fatigue)，并执行严苛的时序因果打乱测试。
+Version: V8.3 Final (Clinical Computational Science Protocol)
 """
-
 import torch
 import numpy as np
-import os
-import sys
-import warnings
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.metrics import average_precision_score, roc_auc_score, brier_score_loss
-from sklearn.isotonic import IsotonicRegression
-from tqdm import tqdm
-
+from sklearn.metrics import average_precision_score, roc_auc_score
 from dl_model import LatentDynamicsForecastingNet
 
-warnings.filterwarnings("ignore")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def load_dataset(file_path):
-    if not os.path.exists(file_path):
-        sys.exit(f"[Error] 未找到验证集数据: {file_path}")
-    data = torch.load(file_path, map_location='cpu', weights_only=False)
-    return TensorDataset(data['X'], data['Y_pvc'], data['Y_afib'], data['Y_vt'])
+def compute_risk(logits):
+    hazards = 0.5 * torch.sigmoid(logits)
+    log_survival = torch.sum(torch.log(1.0 - hazards + 1e-6), dim=1)
+    return 1.0 - torch.exp(log_survival)
 
-def extract_v8_predictions(model, loader, apply_temporal_shuffle=False):
-    """
-    通用特征与预测提取器 (完美兼容 V8.0 离散生存输出)
-    """
+def extract_causal_predictions(model, loader, mode='baseline'):
     model.eval()
-    all_preds = []
-    all_trues = []
-    
+    all_preds, all_trues = [], []
     with torch.no_grad():
-        pbar = tqdm(loader, desc="[推断] 提取生存动力学特征" if not apply_temporal_shuffle else "[测试] 执行时序拓扑打乱", leave=False)
-        for bx, _, _, by_vt in pbar:
+        for bx, _, _, by_vt in loader:
             bx = bx.to(device)
-            
-            # 👇【V7.5/V8.0 跨域物理通道对齐补丁】👇
-            if bx.size(2) == 1:
-                bx = bx.repeat(1, 1, 12, 1)
+            if mode == 'shuffle':
+                bx = bx[:, torch.randperm(bx.size(1)), :, :]
+            elif mode == 'reverse':
+                bx = torch.flip(bx, dims=[1])
                 
-            # 🌪️【打乱 10min 时序拓扑】🌪️
-            if apply_temporal_shuffle:
-                # bx shape: [Batch, SeqLen, Channels, SignalLen]
-                # 在 SeqLen (时序窗口) 维度上进行随机打乱，摧毁时间箭头
-                seq_len = bx.size(1)
-                shuffled_indices = torch.randperm(seq_len)
-                bx = bx[:, shuffled_indices, :, :]
-
-            h_idx_5m = torch.full((bx.size(0),), 2, dtype=torch.long).to(device)
-            out = model(bx, h_idx_5m)
+            out = model(bx)
+            final_logits = out["preds"]["vt_hazard_logits"][:, -1, :]
             
-            # 👇【V8.0 推断端：多视界 Hazard 坍缩为累积绝对风险】👇
-            logits = out["preds"]["vt_hazard_logits"]
-            
-            if logits.dim() == 2 and logits.size(1) == 3:
-                # V8.0 离散生存逻辑：计算 P(5m) = 1 - (1-h1)(1-h2)(1-h3)
-                hazards = torch.sigmoid(logits)
-                survival_prob = torch.prod(1.0 - hazards, dim=1)
-                risk_5m = 1.0 - survival_prob
-            else:
-                # 兼容旧版本
-                risk_5m = torch.sigmoid(logits)
-                
-            all_preds.extend(risk_5m.cpu().numpy())
-            
-            # 👇【V8.0 标签降维：将 3-Bin 序列降维为临床二分类终点】👇
-            if by_vt.dim() > 1:
-                # 只要序列里有 1 (不管在哪个 Bin)，最终临床结果就是发作了 VT
-                is_event = (by_vt == 1).any(dim=1).float()
-                all_trues.extend(is_event.numpy())
-            else:
-                all_trues.extend(by_vt.numpy())
-                
+            all_preds.extend(compute_risk(final_logits).cpu().numpy())
+            is_event = (by_vt[:, -1, :] == 1).any(dim=1).float()
+            all_trues.extend(is_event.numpy())
     return np.array(all_preds), np.array(all_trues)
 
-def evaluate_clinical_system():
-    print(f"🏥 启动 PTFN 临床决策评估中心... [运算核心: {device}]")
+def evaluate_latent_matched_control(model, loader, epsilon=5.0):
+    model.eval()
+    all_z, all_labels, all_preds = [], [], []
+    print("🔬 执行 Latent-Matched 轨迹匹配扫描...")
+    with torch.no_grad():
+        for bx, _, _, by_vt in loader:
+            bx = bx.to(device)
+            
+            B, S, C, L = bx.shape
+            x_flat = bx.view(B * S, C, L)
+            z_flat = model.window_encoder(x_flat)
+            z_seq = z_flat.view(B, S, -1)
+            z_global = torch.mean(z_seq, dim=1) 
+            
+            out = model(bx)
+            risk = compute_risk(out["preds"]["vt_hazard_logits"][:, -1, :])
+            is_event = (by_vt[:, -1, :] == 1).any(dim=1).float()
+            
+            all_z.append(z_global)
+            all_preds.append(risk)
+            all_labels.append(is_event)
+            
+    Z = torch.cat(all_z, dim=0).cpu()
+    Y = torch.cat(all_labels, dim=0).cpu()
+    P = torch.cat(all_preds, dim=0).cpu()
     
-    # 1. 装载模型
-    model = LatentDynamicsForecastingNet().to(device)
-    v8_weights = 'models/ptfn_v8_best.pth'
-    if not os.path.exists(v8_weights):
-        sys.exit(f"[Error] 找不到 V8.0 权重 {v8_weights}，请先运行 train_trajectory.py！")
+    vt_idx = torch.where(Y == 1)[0]
+    ctrl_idx = torch.where(Y == 0)[0]
+    
+    valid_pairs = []
+    for v_i in vt_idx:
+        dists = torch.cdist(Z[v_i].unsqueeze(0), Z[ctrl_idx])[0]
+        min_dist, min_idx = torch.min(dists), torch.argmin(dists)
         
-    print("⏳ 装载 PTFN (V8.0) 模型权重...")
-    model.load_state_dict(torch.load(v8_weights, map_location=device, weights_only=True))
-    print("✅ 权重载入成功！")
-    
-    # 2. 装载数据
-    print("⏳ 装载真实物理隔离验证集 (dataset/ptfn_val.pt)...")
-    val_dataset = load_dataset('dataset/ptfn_val.pt')
-    # batch_size 为 1 才能更精确地模拟连续的时间流(用于真正的 TEG/FAB 计算)，但为加速评估，此处用 64 提取概率
-    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
-    
-    # 3. 提取基线特征
-    print("🔬 提取基线动力学特征与原始生存风险概率...")
-    raw_preds_vt, true_vt = extract_v8_predictions(model, val_loader, apply_temporal_shuffle=False)
-    
-    # 4. 概率校准 (Isotonic Regression)
-    print("⚖️ 执行 Isotonic Regression 临床概率校准...")
-    ir = IsotonicRegression(out_of_bounds='clip')
-    # 这里的 raw_preds_vt 和 true_vt 现在都是纯粹的 1D Array，绝对不会再报错了
-    calibrated_preds_vt = ir.fit_transform(raw_preds_vt, true_vt)
-    
-    # 5. 计算宏观指标
-    baseline_auprc = average_precision_score(true_vt, calibrated_preds_vt)
-    baseline_auroc = roc_auc_score(true_vt, calibrated_preds_vt)
-    brier_before = brier_score_loss(true_vt, raw_preds_vt)
-    brier_after = brier_score_loss(true_vt, calibrated_preds_vt)
-    
-    # 6. 时序因果打乱测试 (Ablation)
-    print("🌪️ 运行全集反事实时序消融测试 (检验生存动力学因果律)...")
-    shuffled_preds_vt, _ = extract_v8_predictions(model, val_loader, apply_temporal_shuffle=True)
-    # 打乱后的概率同样需要经过同一套校准器映射
-    calibrated_shuffled_preds = ir.transform(shuffled_preds_vt)
-    shuffled_auprc = average_precision_score(true_vt, calibrated_shuffled_preds)
-    
-    # ================== 打印终极医学报告 ==================
-    print("\n" + "="*69)
-    print("🏥 PTFN 临床决断力综合评估报告 (V8.0 Survival Protocol)")
-    print("="*69)
-    
-    print("【一、 宏观预测有效性 (Statistical Efficacy)】")
-    print(f"* 验证样本量:          {len(true_vt)} (VT正样本数: {int(sum(true_vt))})")
-    print(f"* 原始 AUPRC (核心):   {baseline_auprc:.4f}")
-    print(f"* AUROC:               {baseline_auroc:.4f}")
-    
-    print("\n【二、 概率可靠性校准 (Calibration Quality)】")
-    print(f"* Brier Score (校准前): {brier_before:.4f}")
-    print(f"* Brier Score (校准后): {brier_after:.4f} ⬇️ (越小越好)")
-    
-    print("\n【三、 时序因果性探伤 (Temporal Causal Integrity)】")
-    print(f"* 全集基线 AUPRC:         {baseline_auprc:.4f}")
-    print(f"* 打乱 10min 时序拓扑后:  {shuffled_auprc:.4f}")
-    
-    diff = baseline_auprc - shuffled_auprc
-    if diff > 0.05:
-        print(f"  🔥 [PI 结论]: AUPRC 断崖式暴跌 (-{diff:.4f})！")
-        print("     铁证如山：Survival Loss 成功封杀了『病理计数捷径』，模型已习得时间演化因果律！")
-    elif diff > 0.02:
-        print(f"  ✅ [PI 结论]: AUPRC 显著下降 (-{diff:.4f})。模型开始深度依赖时序梯度。")
+        if min_dist < epsilon:
+            valid_pairs.append({'vt_risk': P[v_i].item(), 'ctrl_risk': P[ctrl_idx[min_idx]].item()})
+            
+    if len(valid_pairs) > 0:
+        vt_risks = [p['vt_risk'] for p in valid_pairs]
+        ctrl_risks = [p['ctrl_risk'] for p in valid_pairs]
+        pair_y = [1]*len(vt_risks) + [0]*len(ctrl_risks)
+        pair_preds = vt_risks + ctrl_risks
+        auroc = roc_auc_score(pair_y, pair_preds)
+        print(f"🎯 成功找到 {len(valid_pairs)} 对形态学双胞胎！动力学独立剥离 AUROC: {auroc:.4f}")
     else:
-        print(f"  ⚠️ [PI 结论]: AUPRC 下降微弱 (-{diff:.4f})。模型依然存在统计作弊嫌疑。")
-        
-    print("="*69)
+        print("⚠️ 未找到满足严苛条件的双胞胎样本。")
+
+def main():
+    print("="*60)
+    print("🏥 PTFN 计算临床科学检验平台 (V8.3 Causal Protocol)")
+    print("="*60)
+    
+    model = LatentDynamicsForecastingNet().to(device)
+    model.load_state_dict(torch.load('models/ptfn_v83_core.pth', map_location=device, weights_only=True))
+    
+    data = torch.load('dataset/ptfn_val.pt', map_location='cpu', weights_only=False)
+    val_loader = DataLoader(TensorDataset(data['X'], data['Y_pvc'], data['Y_afib'], data['Y_vt']), batch_size=64, shuffle=False)
+    
+    base_p, trues = extract_causal_predictions(model, val_loader, mode='baseline')
+    base_auprc = average_precision_score(trues, base_p)
+    print(f"[1] 自然因果流 AUPRC:      {base_auprc:.4f}")
+    
+    shuf_p, _ = extract_causal_predictions(model, val_loader, mode='shuffle')
+    shuf_auprc = average_precision_score(trues, shuf_p)
+    print(f"[2] 拓扑打乱后 AUPRC:      {shuf_auprc:.4f} (Drop: {base_auprc - shuf_auprc:.4f})")
+    
+    rev_p, _ = extract_causal_predictions(model, val_loader, mode='reverse')
+    rev_auprc = average_precision_score(trues, rev_p)
+    print(f"[3] 时光倒流后 AUPRC:      {rev_auprc:.4f} (Drop: {base_auprc - rev_auprc:.4f})")
+    
+    evaluate_latent_matched_control(model, val_loader)
 
 if __name__ == "__main__":
-    evaluate_clinical_system()
+    main()
