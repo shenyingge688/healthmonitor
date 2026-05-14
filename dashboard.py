@@ -1,6 +1,6 @@
 ﻿"""
 Script: dashboard.py
-Version: V10.1 (Objective Clinical UI - Async Streaming)
+Version: V10.4 (Master Clinical UI - Pure Signal Edition)
 """
 import streamlit as st
 import requests
@@ -17,14 +17,7 @@ st.set_page_config(page_title="临床动力学终端", layout="wide")
 
 if 'anomaly_logs' not in st.session_state:
     st.session_state.anomaly_logs = []
-if 'is_streaming' not in st.session_state:
-    st.session_state.is_streaming = False
-if 'api_session' not in st.session_state:
-    st.session_state.api_session = requests.Session()
 
-# ==========================================
-# 侧边栏与数据加载
-# ==========================================
 st.sidebar.title("📡 V10 临床监测台")
 clinical_cases = {
     "100": {"bed_label": "档案 100 (基线平稳)", "desc": "主要包含正常心搏 (N)，基线平稳。"},
@@ -36,14 +29,8 @@ clinical_cases = {
 }
 
 selected_id = st.sidebar.selectbox("选择监测源", options=list(clinical_cases.keys()), format_func=lambda x: clinical_cases[x]["bed_label"])
-start_mins = st.sidebar.slider("设定起始点 (分钟)", 0.0, 15.0, 10.0, 0.1)
-
-# 🚀 替换为可控状态的按钮
-col_btn1, col_btn2 = st.sidebar.columns(2)
-if col_btn1.button("🔴 启动数据推流", use_container_width=True):
-    st.session_state.is_streaming = True
-if col_btn2.button("⏹️ 停止数据推流", use_container_width=True):
-    st.session_state.is_streaming = False
+start_mins = st.sidebar.slider("设定推演起始点 (分钟)", 10.0, 25.0, 10.0, 0.5)
+st.sidebar.caption("⏳ **医学提示**: V10 引擎需截取前 10 分钟信号建立动力学基线 (Burn-in)，推演强制从第 10 分钟起步。")
 
 if st.sidebar.button("🗑️ 清空追踪日志", use_container_width=True):
     st.session_state.anomaly_logs = []
@@ -112,8 +99,7 @@ def build_prob_column_html(title, prob_list):
     html += "</div>"
     return html
 
-# 使用状态标志位控制循环
-if st.session_state.is_streaming:
+if st.sidebar.button("🔴 启动数据推流", use_container_width=True):
     sim_step = 0
     base_offset_pts = int(start_mins * 60 * 250)
     ecg_buffer = np.full(1000, np.nan)
@@ -125,11 +111,9 @@ if st.session_state.is_streaming:
     last_risk, last_trajectory = 0.0, [0.0] * 10
     cached_warning_html = ""
 
-    while st.session_state.is_streaming:
+    while True:
         current_pts = base_offset_pts + (sim_step * step_size)
-        if current_pts >= len(data_source) - 1: 
-            st.session_state.is_streaming = False
-            break
+        if current_pts >= len(data_source) - 1: break
 
         new_data = data_source[current_pts - step_size : current_pts]
         idx = (sim_step * step_size) % display_len
@@ -154,26 +138,22 @@ if st.session_state.is_streaming:
             if len(full_win) < 150000: full_win = np.pad(full_win, (150000 - len(full_win), 0), 'constant')
             
             try:
-                # 🚀 替换为 Session 连接池，减少建立 TCP 的握手开销避免前端卡顿
-                resp = st.session_state.api_session.post("http://127.0.0.1:8000/api/predict", json={"ecg": full_win.tolist()}, timeout=3)
+                # 🚀 已剥离 Z-score，直接输送原始带偏置的物理数据
+                resp = requests.post("http://127.0.0.1:8000/api/predict", json={"ecg": full_win.tolist()}, timeout=3)
+                
                 if resp.status_code == 200:
                     api_status_box.empty() 
                     data = resp.json()
                     
                     if 'rhythm' in data:
-                        rhythm_data = data.get('rhythm')
-                        crit_data = data.get('criticality')
-                        hazard_data = data.get('hazard')
+                        rhythm_data = data.get('rhythm', [1.0, 0.0, 0.0, 0.0])
+                        crit_data = data.get('criticality', [1.0, 0.0, 0.0, 0.0])
+                        hazard_data = data.get('hazard', [0.0, 0.0, 0.0])
                         last_risk = hazard_data[-1] 
                         new_traj = data.get('risk_trajectory', [])
                     else:
                         api_status_box.warning("⚠️ 检测到旧版 FastAPI 响应格式。请更新 backend 以获得完整三维输出！")
-                        rhythm_data = [data.get('normal_prob', 1.0), data.get('pvc_prob', 0.0), data.get('afib_prob', 0.0), 0.0]
-                        crit_data = [1.0 - data.get('vt_risk_5m', 0.0), 0.0, data.get('vt_risk_5m', 0.0), 0.0]
-                        hazard_data = [0.0, 0.0, data.get('vt_risk_5m', 0.0)]
-                        last_risk = data.get('vt_risk_5m', 0.0)
-                        new_traj = data.get('risk_trajectory', [])
-
+                        
                     if len(new_traj) > 0 and new_traj != last_trajectory:
                         last_trajectory = new_traj
                         time_axis = np.linspace(-10, 0, len(last_trajectory))
@@ -216,33 +196,33 @@ if st.session_state.is_streaming:
             {"label": "5分钟 崩溃预警", "prob": hazard_data[2], "color": "#DC2626"}
         ]
 
-        cri_list_sorted = sorted(cri_list, key=lambda x: x['prob'], reverse=True)
-        primary_cri = cri_list_sorted[0]
-        for item in cri_list_sorted:
-            if item["label"] != "安全界限 (Safe)" and item["prob"] > 0.25:
-                primary_cri = item
-                break
+        diag_title = "未见急症指征"
+        diag_desc = "生命体征平稳，未见明显血液动力学恶化趋势。"
+        accent_color = "#10B981" 
 
-        if primary_cri["label"] == "安全界限 (Safe)":
-            diag_title = "未见急症指征"
-            diag_desc = "当前信号危急度处于安全范围。"
-            accent_color = "#10B981"
-        elif primary_cri["label"] == "异位负荷 (PVC-Load)":
-            diag_title = "室性异位搏动"
-            diag_desc = "存在室性早搏，建议关注负荷分布。"
-            accent_color = "#F59E0B"
-        elif primary_cri["label"] == "室速威胁 (VT)":
-            diag_title = "⚠️ 疑似室性心动过速"
-            diag_desc = "检测到心室快速起搏特征，存在血液动力学风险。"
-            accent_color = "#EF4444"
-        else:
-            diag_title = "🚨 极危: 心室颤动/扑动"
-            diag_desc = "生命体征即将或已经崩溃，请立即确认。"
-            accent_color = "#991B1B"
+        if rhythm_data[2] > 0.40:
+            diag_title = "⚠️ 心房颤动 / 节律异常"
+            diag_desc = "检测到心房异常激惹，需防范远期血栓与心衰风险。"
+            accent_color = "#F97316" 
+            
+        if crit_data[1] > 0.30:
+            diag_title = "⚠️ 显著室性异位搏动"
+            diag_desc = "室早负荷升高，可能诱发更严重的心律失常。"
+            accent_color = "#F59E0B" 
+
+        if crit_data[2] > 0.15 or crit_data[3] > 0.15:
+            diag_title = "🚨 极危: 室速/室颤发作"
+            diag_desc = "检测到致命性心律失常特征，请立即确认生命体征！"
+            accent_color = "#EF4444" 
+
+        if hazard_data[2] > 0.60:
+            diag_title = "💀 警告: 系统性崩溃预兆"
+            diag_desc = f"严重预警！模型强烈提示 5 分钟内发生危及生命的临床崩溃概率达 {hazard_data[2]*100:.1f}%！"
+            accent_color = "#991B1B" 
 
         dist_html = "<div style='display: flex; flex-wrap: wrap; margin-top: 15px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 15px;'>"
         dist_html += build_prob_column_html("🎯 节律中枢 (Rhythm)", sorted(rhy_list, key=lambda x: x['prob'], reverse=True))
-        dist_html += build_prob_column_html("🫀 危急评估 (Criticality)", cri_list_sorted)
+        dist_html += build_prob_column_html("🫀 危急评估 (Criticality)", sorted(cri_list, key=lambda x: x['prob'], reverse=True))
         dist_html += build_prob_column_html("⚠️ 生存预警 (Hazard)", haz_list)
         dist_html += "</div>"
             
