@@ -1,12 +1,13 @@
 ﻿"""
 Script: train_trajectory.py
-Version: V10.7 (Clinical Stable Engine - Scheduler BugFix & Inference Optimized)
+Version: V10.11 (The Flawless Master - BCE精度溢出修复 & 学习率动力学重构)
 """
 
 import os
 import glob
 import math
 import time
+import gc
 from copy import deepcopy
 
 import torch
@@ -22,16 +23,14 @@ from sklearn.metrics import (
 
 from dl_model import HierarchicalHazardNet
 
-
 # =========================================================
 # 🚀 CUDA 极致加速
 # =========================================================
 torch.backends.cudnn.benchmark = True
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
 # =========================================================
-# 📦 加载 shard 数据 (防爆内存 + 统一精度)
+# 📦 加载 shard 数据
 # =========================================================
 def load_sharded_datasets(split_prefix):
     shard_paths = glob.glob(f"dataset/v10_*_{split_prefix}_shard_*.pt")
@@ -43,8 +42,7 @@ def load_sharded_datasets(split_prefix):
 
     for path in shard_paths:
         data = torch.load(path, map_location="cpu", weights_only=True)
-        # ⚠️ 统一 float32 数值流，防止 AMP 混合计算时精度溢出
-        X = data["X"].float()
+        X = data["X"] 
 
         datasets.append(
             TensorDataset(
@@ -59,9 +57,8 @@ def load_sharded_datasets(split_prefix):
         )
     return ConcatDataset(datasets)
 
-
 # =========================================================
-# 🧠 EMA (避震器，稳定核心)
+# 🧠 EMA
 # =========================================================
 class EMA:
     def __init__(self, model, decay=0.999):
@@ -72,20 +69,25 @@ class EMA:
     def update(self, model):
         for s, p in zip(self.shadow.parameters(), model.parameters()):
             s.data.mul_(self.decay).add_(p.data, alpha=1 - self.decay)
-
+        for s, p in zip(self.shadow.buffers(), model.buffers()):
+            s.data.copy_(p.data)
 
 # =========================================================
-# 📉 Warmup + Cosine 调度策略 (基于 Global Step)
+# 📉 修复后的动力学 Scheduler (倍率映射)
 # =========================================================
 def lr_lambda(step, warmup=1500, total=60000):
+    min_factor = 0.01  # 保证 LR 永远不会低于 base_lr 的 1%
+    
     if step < warmup:
-        return max(step / warmup, 1e-4) # 加个底限，防止除以 0 或过小
+        # 预热期：倍率从 1% 线性爬升到 100%
+        return min_factor + (1.0 - min_factor) * (step / warmup)
+        
+    # 退火期：余弦平滑下降，最低回到 1%
     progress = (step - warmup) / max(total - warmup, 1)
-    return 0.5 * (1 + math.cos(math.pi * progress))
-
+    return min_factor + 0.5 * (1.0 - min_factor) * (1 + math.cos(math.pi * progress))
 
 # =========================================================
-# 🔥 单 Epoch 训练 (修复 Bug 版)
+# 🔥 单 Epoch 训练 
 # =========================================================
 def train_one_epoch(
     epoch,
@@ -94,7 +96,7 @@ def train_one_epoch(
     ema,
     loader,
     optimizer,
-    scheduler, # ✅ 修改：传入 scheduler
+    scheduler,
     scaler,
     crit_weights,
     step_counter,
@@ -109,12 +111,10 @@ def train_one_epoch(
     for batch_idx, batch in enumerate(pbar):
         bx, y_rhy, y_cri, y_haz, m_rhy, m_cri, m_haz = batch
 
-        # ❗ 脏数据熔断
         if not torch.isfinite(bx).all():
             continue
 
-        # 🚀 GPU 搬运
-        bx = bx.to(device, non_blocking=True)
+        bx = bx.to(device, dtype=torch.float32, non_blocking=True)
         y_rhy = y_rhy.to(device, non_blocking=True)
         y_cri = y_cri.to(device, non_blocking=True)
         y_haz = y_haz.to(device, non_blocking=True)
@@ -124,48 +124,45 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
-        # ⚡ AMP Forward
         with torch.amp.autocast("cuda"):
             out = model(bx)["preds"]
-            
             rhythm_logits = out["rhythm_logits"][:, -1]
             criticality_logits = out["criticality_logits"][:, -1]
             hazard_probs = out["hazard_probs"][:, -1]
 
-        # 📉 多任务 Loss (强转 float32 保证概率计算绝对安全)
+        # 🚀 修复雷区 1：强行 Clamp，切断由于 Float32 精度漂移导致的 BCE NaN 崩溃
+        safe_hazard_probs = hazard_probs.float().clamp(1e-7, 1.0 - 1e-7)
+
         loss_r = F.cross_entropy(rhythm_logits.float(), y_rhy, reduction="none")
         loss_c = F.cross_entropy(criticality_logits.float(), y_cri, weight=crit_weights, reduction="none")
-        loss_h = F.binary_cross_entropy(hazard_probs.float(), y_haz.float(), reduction="none").mean(dim=-1)
+        loss_h = F.binary_cross_entropy(safe_hazard_probs, y_haz.float(), reduction="none").mean(dim=-1)
 
-        # 🎭 Mask 掩码阻断
         loss_r = (loss_r * m_rhy).sum() / m_rhy.sum().clamp_min(1e-6)
         loss_c = (loss_c * m_cri).sum() / m_cri.sum().clamp_min(1e-6)
         loss_h = (loss_h * m_haz).sum() / m_haz.sum().clamp_min(1e-6)
 
-        # 🧮 总 Loss 融合
-        total = 1.0 * loss_r + 1.5 * loss_c + 1.0 * loss_h # 恢复 C 和 H 的权重比例
+        total = 1.0 * loss_r + 1.5 * loss_c + 1.0 * loss_h
 
-        # 🔥 Backward
         scaler.scale(total).backward()
         scaler.unscale_(optimizer)
 
-        # 🚨 物理防爆护盾：梯度的最大模长限制为 1.0
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
+        scale_before = scaler.get_scale()
         scaler.step(optimizer)
         scaler.update()
+        scale_after = scaler.get_scale()
 
-        # ✅ 核心修复：按 Batch 推进学习率
-        scheduler.step() 
-        ema.update(model)
+        if scale_before <= scale_after:
+            scheduler.step() 
+            ema.update(model) 
+            
+            total_loss += total.item()
+            valid_batches += 1
+            step_counter[0] += 1
 
-        total_loss += total.item()
-        valid_batches += 1
-        step_counter[0] += 1
-
-        # 📊 实时日志刷新
         elapsed = time.time() - start_time
-        avg_time = elapsed / (batch_idx + 1)
+        avg_time = elapsed / max(batch_idx + 1, 1)
         remain = avg_time * (len(loader) - batch_idx - 1)
         lr = optimizer.param_groups[0]["lr"]
 
@@ -180,12 +177,11 @@ def train_one_epoch(
 
     return total_loss / max(valid_batches, 1)
 
-
 # =========================================================
-# 📊 Validation (使用底层 C++ 极速模式)
+# 📊 Validation
 # =========================================================
-@torch.inference_mode() # ✅ 优化：比 no_grad 更快的极速模式
-def validate(model, loader):
+@torch.inference_mode()
+def validate(model, loader, crit_weights):
     model.eval()
     total_loss = 0.0
     n = 0
@@ -195,11 +191,18 @@ def validate(model, loader):
     all_hazard_probs, all_hazard_targets = [], []
 
     for batch in loader:
-        bx, y_rhy, y_cri, y_haz, _, _, _ = batch
-        bx = bx.to(device, non_blocking=True)
+        bx, y_rhy, y_cri, y_haz, m_rhy, m_cri, m_haz = batch
+        
+        if not torch.isfinite(bx).all():
+            continue
+            
+        bx = bx.to(device, dtype=torch.float32, non_blocking=True)
         y_rhy = y_rhy.to(device, non_blocking=True)
         y_cri = y_cri.to(device, non_blocking=True)
         y_haz = y_haz.to(device, non_blocking=True)
+        m_rhy = m_rhy.to(device, non_blocking=True)
+        m_cri = m_cri.to(device, non_blocking=True)
+        m_haz = m_haz.to(device, non_blocking=True)
 
         with torch.amp.autocast("cuda"):
             out = model(bx)["preds"]
@@ -207,29 +210,43 @@ def validate(model, loader):
             criticality_logits = out["criticality_logits"][:, -1]
             hazard_probs = out["hazard_probs"][:, -1]
 
-        # 仅用于记录的伪 Loss
-        loss_r = F.cross_entropy(rhythm_logits.float(), y_rhy)
-        loss_c = F.cross_entropy(criticality_logits.float(), y_cri)
-        loss = loss_r + loss_c
+        safe_hazard_probs = hazard_probs.float().clamp(1e-7, 1.0 - 1e-7)
+
+        loss_r = F.cross_entropy(rhythm_logits.float(), y_rhy, reduction="none")
+        loss_c = F.cross_entropy(criticality_logits.float(), y_cri, weight=crit_weights, reduction="none")
+        loss_h = F.binary_cross_entropy(safe_hazard_probs, y_haz.float(), reduction="none").mean(dim=-1)
+
+        loss_r = (loss_r * m_rhy).sum() / m_rhy.sum().clamp_min(1e-6)
+        loss_c = (loss_c * m_cri).sum() / m_cri.sum().clamp_min(1e-6)
+        loss_h = (loss_h * m_haz).sum() / m_haz.sum().clamp_min(1e-6)
+
+        loss = 1.0 * loss_r + 1.5 * loss_c + 1.0 * loss_h
         total_loss += loss.item()
         n += 1
 
-        # 收集结果
-        all_rhythm_preds.extend(torch.argmax(rhythm_logits, dim=-1).cpu().numpy())
-        all_rhythm_targets.extend(y_rhy.cpu().numpy())
-        
-        all_crit_preds.extend(torch.argmax(criticality_logits, dim=-1).cpu().numpy())
-        all_crit_targets.extend(y_cri.cpu().numpy())
-        
-        all_hazard_probs.extend(hazard_probs.float().cpu().numpy())
-        all_hazard_targets.extend(y_haz.cpu().numpy())
+        idx_rhy = (m_rhy > 0.5).nonzero(as_tuple=True)[0]
+        if len(idx_rhy) > 0:
+            all_rhythm_preds.extend(torch.argmax(rhythm_logits[idx_rhy], dim=-1).cpu().numpy())
+            all_rhythm_targets.extend(y_rhy[idx_rhy].cpu().numpy())
+            
+        idx_cri = (m_cri > 0.5).nonzero(as_tuple=True)[0]
+        if len(idx_cri) > 0:
+            all_crit_preds.extend(torch.argmax(criticality_logits[idx_cri], dim=-1).cpu().numpy())
+            all_crit_targets.extend(y_cri[idx_cri].cpu().numpy())
+            
+        idx_haz = (m_haz > 0.5).nonzero(as_tuple=True)[0]
+        if len(idx_haz) > 0:
+            all_hazard_probs.extend(hazard_probs[idx_haz].float().cpu().numpy())
+            all_hazard_targets.extend(y_haz[idx_haz].cpu().numpy())
 
-    # 计算高级 Metrics
-    rhythm_acc = accuracy_score(all_rhythm_targets, all_rhythm_preds)
-    crit_f1 = f1_score(all_crit_targets, all_crit_preds, average="macro", zero_division=0)
+    rhythm_acc = accuracy_score(all_rhythm_targets, all_rhythm_preds) if len(all_rhythm_targets) > 0 else 0.0
+    crit_f1 = f1_score(all_crit_targets, all_crit_preds, average="macro", zero_division=0) if len(all_crit_targets) > 0 else 0.0
     
     try:
-        hazard_auprc = average_precision_score(all_hazard_targets, all_hazard_probs, average="macro")
+        if len(all_hazard_targets) > 0:
+            hazard_auprc = average_precision_score(all_hazard_targets, all_hazard_probs, average="macro")
+        else:
+            hazard_auprc = 0.0
     except:
         hazard_auprc = 0.0
 
@@ -240,13 +257,12 @@ def validate(model, loader):
         "hazard_auprc": hazard_auprc,
     }
 
-
 # =========================================================
 # 🚀 启动控制台
 # =========================================================
 def main():
     print("=" * 72)
-    print(f"🚀 V10.7 Master Clinical Engine | Device = {device}")
+    print(f"🚀 V10.11 Flawless Master Engine | Device = {device}")
     print("=" * 72)
 
     train_dataset = load_sharded_datasets("train")
@@ -259,14 +275,13 @@ def main():
     EPOCHS = 30
     BATCH_SIZE = 32
 
-    # ✅ 优化：drop_last=True 防止尾部残缺 batch 污染 BatchNorm
     train_loader = DataLoader(
         train_dataset, batch_size=BATCH_SIZE, shuffle=True, 
-        num_workers=4, pin_memory=True, persistent_workers=True, drop_last=True
+        num_workers=0, pin_memory=True, drop_last=True
     )
     val_loader = DataLoader(
         val_dataset, batch_size=BATCH_SIZE, shuffle=False, 
-        num_workers=2, pin_memory=True
+        num_workers=0, pin_memory=True
     )
 
     print(f"✅ Train Samples : {len(train_dataset)}")
@@ -274,7 +289,6 @@ def main():
 
     model = HierarchicalHazardNet().to(device)
 
-    # 🔥 挂载 PTBXL 预训练骨干
     backbone_path = "models/ptbxl_backbone.pth"
     if os.path.exists(backbone_path):
         print("🧠 检测到 PTBXL 预训练骨干，正在进行知识迁移...")
@@ -288,13 +302,12 @@ def main():
     scaler = torch.amp.GradScaler("cuda")
     crit_weights = torch.tensor([1.0, 2.0, 5.0, 8.0], device=device)
 
-    # 计算真实的 Total Steps 用于 Cosine 退火
     total_steps = len(train_loader) * EPOCHS
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lr_lambda=lambda step: lr_lambda(step, warmup=1500, total=total_steps)
     )
 
-    best_val = float("inf")
+    best_clinical_score = -1.0 
     step_counter = [0]
 
     for epoch in range(1, EPOCHS + 1):
@@ -302,24 +315,27 @@ def main():
 
         train_loss = train_one_epoch(
             epoch, EPOCHS, model, ema, train_loader, optimizer, 
-            scheduler, scaler, crit_weights, step_counter # ✅ 修改：传入 scheduler
+            scheduler, scaler, crit_weights, step_counter
         )
 
-        val_metrics = validate(ema.shadow, val_loader)
+        val_metrics = validate(ema.shadow, val_loader, crit_weights)
 
         epoch_time = time.time() - epoch_start
         
         print("\n" + "=" * 72)
         print(f"📊 Epoch [{epoch:02d}/{EPOCHS}] 报告 | 用时: {epoch_time/60:.1f} 分钟")
         print(f"🔥 Train Loss       : {train_loss:.4f}")
-        print(f"📉 EMA Val Loss    : {val_metrics['loss']:.4f}")
-        print(f"🎯 Rhythm Acc      : {val_metrics['rhythm_acc']:.4f}")
-        print(f"🫀 Criticality F1  : {val_metrics['crit_f1']:.4f}")
-        print(f"⚠️ Hazard AUPRC    : {val_metrics['hazard_auprc']:.4f}")
-        print(f"📈 最终学习率      : {optimizer.param_groups[0]['lr']:.2e}")
+        print(f"📉 EMA Val Loss     : {val_metrics['loss']:.4f}")
+        print(f"🎯 Rhythm Acc       : {val_metrics['rhythm_acc']:.4f}")
+        print(f"🫀 Criticality F1   : {val_metrics['crit_f1']:.4f}")
+        print(f"⚠️ Hazard AUPRC     : {val_metrics['hazard_auprc']:.4f}")
+        print(f"📈 最终学习率       : {optimizer.param_groups[0]['lr']:.2e}")
         
-        if val_metrics["loss"] < best_val:
-            best_val = val_metrics["loss"]
+        current_clinical_score = (0.4 * val_metrics['crit_f1']) + (0.6 * val_metrics['hazard_auprc'])
+        print(f"🌟 复合临床终点得分 : {current_clinical_score:.4f}")
+
+        if current_clinical_score > best_clinical_score:
+            best_clinical_score = current_clinical_score
             os.makedirs("models", exist_ok=True)
             save_path = "models/v10_master_best.pth"
             torch.save({
@@ -328,11 +344,14 @@ def main():
                 "optimizer": optimizer.state_dict(),
                 "scaler": scaler.state_dict(),
                 "epoch": epoch,
-                "best_val": best_val,
+                "best_score": best_clinical_score,
                 "metrics": val_metrics,
             }, save_path)
-            print(f"💾 ★ 全新记录！模型已锁定并保存 -> {save_path}")
+            print(f"💾 ★ 临床指标突破！模型已锁定并保存 -> {save_path}")
         print("=" * 72)
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
 if __name__ == "__main__":
     main()

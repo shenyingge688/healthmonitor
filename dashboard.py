@@ -1,32 +1,42 @@
 ﻿"""
 Script: dashboard.py
-Version: V10.0 (ICU Telemetry Foundation UI)
+Version: V10.1 (Objective Clinical UI - BugFix & Bilingual Labels)
 """
 import streamlit as st
-import numpy as np
-import pandas as pd
 import requests
+import numpy as np
 import wfdb
 import time
-import os
+import pandas as pd
 import altair as alt
 from scipy import signal
 from scipy.signal import butter, filtfilt
+import os
 
-st.set_page_config(page_title="V10 层级化临床终端", layout="wide")
+st.set_page_config(page_title="临床动力学终端", layout="wide")
 
+if 'anomaly_logs' not in st.session_state:
+    st.session_state.anomaly_logs = []
+
+# ==========================================
+# 侧边栏与数据加载
+# ==========================================
+st.sidebar.title("📡 V10 临床监测台")
 clinical_cases = {
-    "100": {"bed_label": "档案 100 (基线平稳)", "desc": "基础节律为正常窦性，血流动力学极度稳定。"},
-    "119": {"bed_label": "档案 119 (室早负荷)", "desc": "包含室性早搏，观察临界激惹状态。"},
-    "201": {"bed_label": "档案 201 (房颤演变)", "desc": "RR间期绝对不齐，典型房颤。"},
-    "207": {"bed_label": "档案 207 (室速发作)", "desc": "极危：持续室性心动过速 (VT)。"},
-    "209": {"bed_label": "档案 209 (房速/SVT)", "desc": "室上性激惹，快心率但不伴随室性失代偿。"},
-    "PROSIM_01": {"bed_label": "外部硬件源 (ProSim)", "desc": "示波器直连。"}
+    "100": {"bed_label": "档案 100 (基线平稳)", "desc": "主要包含正常心搏 (N)，基线平稳。"},
+    "119": {"bed_label": "档案 119 (室早负荷)", "desc": "包含室性早搏 (V) 波形。"},
+    "201": {"bed_label": "档案 201 (房颤演变)", "desc": "RR间期绝对不齐，呈现房颤特征。"},
+    "207": {"bed_label": "档案 207 (室速/室扑)", "desc": "短阵室性心动过速与室扑交替发作。"},
+    "209": {"bed_label": "档案 209 (房性激惹)", "desc": "存在阵发性室上速/房速发作特征。"},
+    "PROSIM_01": {"bed_label": "外部硬件源 (ProSim 200)", "desc": "示波器直连：硬件模拟生理电信号。"}
 }
 
-st.sidebar.title("📡 V10 监测台")
 selected_id = st.sidebar.selectbox("选择监测源", options=list(clinical_cases.keys()), format_func=lambda x: clinical_cases[x]["bed_label"])
 start_mins = st.sidebar.slider("设定起始点 (分钟)", 0.0, 15.0, 10.0, 0.1)
+
+if st.sidebar.button("🗑️ 清空追踪日志", use_container_width=True):
+    st.session_state.anomaly_logs = []
+    st.rerun()
 
 def clean_ecg_signal(data, fs=360):
     nyq = 0.5 * fs
@@ -36,8 +46,11 @@ def clean_ecg_signal(data, fs=360):
 @st.cache_data
 def load_sim_data(rec_id):
     if rec_id == "PROSIM_01":
-        if os.path.exists("prosim_custom_signal.npy"): return np.load("prosim_custom_signal.npy")
-        else: return np.zeros(300000)
+        if os.path.exists("prosim_custom_signal.npy"):
+            return np.load("prosim_custom_signal.npy")
+        else:
+            return np.zeros(300000)
+
     base_dir = os.path.dirname(os.path.abspath(__file__))
     rec_path = os.path.join(base_dir, 'data', 'mitdb', rec_id)
     if os.path.exists(rec_path + ".dat"): record = wfdb.rdrecord(rec_path, sampto=300000)
@@ -46,47 +59,84 @@ def load_sim_data(rec_id):
 
 data_source = load_sim_data(selected_id)
 
-st.title(f"🏥 层级化临床动力学终端 - {clinical_cases[selected_id]['bed_label']}")
-st.info(f"**【临床特征】** {clinical_cases[selected_id]['desc']}")
+st.title(f"📊 动态推演分析终端 - {clinical_cases[selected_id]['bed_label']}")
+st.info(f"**【病史/体征】** {clinical_cases[selected_id]['desc']}")
 
-col1, col2, col3 = st.columns([1, 1, 1])
+warning_box = st.empty()
+api_status_box = st.empty() # 🚀 新增：API 状态报警器
+
+col1, col2 = st.columns([3, 1])
 with col1:
-    st.markdown("### 🫀 1. 基础组织化节律 (Rhythm)")
-    rhythm_box = st.empty()
+    st.subheader("📡 实时心电波形")
+    chart_placeholder = st.empty()
+    st.markdown("##### 📈 恶化轨迹 (TTE Time-to-Alarm)")
+    traj_placeholder = st.empty()
 with col2:
-    st.markdown("### ⚠️ 2. 心室危急度 (Criticality)")
-    crit_box = st.empty()
-with col3:
-    st.markdown("### 📉 3. 离散生存风险 (Hazard)")
-    hazard_box = st.empty()
+    st.subheader("⏱️ 推演时间")
+    metric_time = st.empty()
+    st.subheader("🚨 综合演化指数")
+    metric_risk = st.empty()
 
 st.divider()
-st.subheader("📡 实时心电波形流")
-chart_placeholder = st.empty()
+st.subheader("📑 并发事件日志")
+log_placeholder = st.empty()
+
+# 辅助函数：调整了 label 宽度以容纳双语
+def build_prob_column_html(title, prob_list):
+    html = f"<div style='flex: 1; min-width: 260px; margin-right: 15px;'>"
+    html += f"<p style='margin:0 0 10px 0; font-weight: 600; color: #A0AEC0; font-size: 13px;'>{title}</p>"
+    for item in prob_list:
+        p_val = min(item['prob'], 1.0)
+        w = p_val * 100
+        c = item['color'] if p_val > 0.05 else "rgba(255,255,255,0.15)"
+        text_c = "#E2E8F0" if p_val > 0.05 else "#64748B"
+        font_w = "600" if p_val > 0.05 else "400"
+        
+        html += f"<div style='display:flex; align-items:center; margin-bottom:6px; color:{text_c}; font-size: 12px;'>"
+        # 🚀 宽度增加到 130px，完整展示中英双语
+        html += f"<span style='width:130px; font-weight:{font_w}; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;'>{item['label']}</span>"
+        html += f"<div style='flex-grow:1; background:rgba(0,0,0,0.3); height:6px; margin:0 10px; border-radius:3px; overflow:hidden;'>"
+        html += f"<div style='width:{w}%; background:{c}; height:100%; border-radius:3px; transition: width 0.3s ease;'></div>"
+        html += "</div>"
+        html += f"<span style='width:45px; text-align:right; font-family:monospace;'>{w:.1f}%</span>"
+        html += "</div>"
+    html += "</div>"
+    return html
 
 if st.sidebar.button("🔴 启动数据推流", use_container_width=True):
     sim_step = 0
     base_offset_pts = int(start_mins * 60 * 250)
     ecg_buffer = np.full(1000, np.nan)
+    display_len, step_size, refresh_rate = 1000, 20, 0.08  
     
+    # 🚀 核心修复 1：把变量提升到全局循环外，防止 API 失败时产生幻觉
+    rhythm_data = [1.0, 0.0, 0.0, 0.0]
+    crit_data = [1.0, 0.0, 0.0, 0.0]
+    hazard_data = [0.0, 0.0, 0.0]
+    last_risk, last_trajectory = 0.0, [0.0] * 10
+    cached_warning_html = ""
+
     while True:
-        current_pts = base_offset_pts + (sim_step * 20)
+        current_pts = base_offset_pts + (sim_step * step_size)
         if current_pts >= len(data_source) - 1: break
 
-        new_data = data_source[current_pts - 20 : current_pts]
-        idx = (sim_step * 20) % 1000
-        ecg_buffer[idx : idx + 20] = new_data
+        new_data = data_source[current_pts - step_size : current_pts]
+        idx = (sim_step * step_size) % display_len
+        ecg_buffer[idx : idx + step_size] = new_data
         
-        gap_end = (idx + 45) % 1000
-        if gap_end > (idx + 20): ecg_buffer[idx + 20 : gap_end] = np.nan
-        else: ecg_buffer[idx + 20 : 1000] = np.nan; ecg_buffer[0 : gap_end] = np.nan
+        gap_end = (idx + step_size + 25) % display_len
+        if gap_end > (idx + step_size): ecg_buffer[idx + step_size : gap_end] = np.nan
+        else: ecg_buffer[idx + step_size : display_len] = np.nan; ecg_buffer[0 : gap_end] = np.nan
 
-        df_plot = pd.DataFrame({'Point': np.arange(1000), 'Signal': ecg_buffer})
+        df_plot = pd.DataFrame({'Point': np.arange(display_len), 'Signal': ecg_buffer})
         line_chart = alt.Chart(df_plot).mark_line(color='#00FF41', strokeWidth=1.5).encode(
-            x=alt.X('Point:Q', scale=alt.Scale(domain=[0, 1000]), axis=None), 
-            y=alt.Y('Signal:Q', scale=alt.Scale(domain=[-3.5, 3.5]), axis=alt.Axis(title="幅度 (mV)"))
+            x=alt.X('Point:Q', scale=alt.Scale(domain=[0, display_len]), axis=None), 
+            y=alt.Y('Signal:Q', scale=alt.Scale(domain=[-3.5, 3.5]), axis=alt.Axis(title="幅度 (mV)", grid=True)) 
         ).properties(height=200).configure_view(strokeOpacity=0) 
         chart_placeholder.altair_chart(line_chart, use_container_width=True)
+
+        cur_sec = current_pts / 250
+        metric_time.metric("当前扫描线", f"{int(cur_sec // 60):02d}:{int(cur_sec % 60):02d}")
 
         if sim_step % 12 == 0:
             full_win = data_source[max(0, current_pts - 150000) : current_pts]
@@ -95,40 +145,120 @@ if st.sidebar.button("🔴 启动数据推流", use_container_width=True):
             try:
                 resp = requests.post("http://127.0.0.1:8000/api/predict", json={"ecg": full_win.tolist()}, timeout=3)
                 if resp.status_code == 200:
+                    api_status_box.empty() # 清除报错
                     data = resp.json()
                     
-                    # 1. 渲染 Rhythm Panel
-                    r_labels = ["正常窦性 (Normal)", "室性负荷 (PVC)", "心房颤动 (AFIB)", "室上性激惹 (SVT/AT)"]
-                    r_idx = np.argmax(data['rhythm_probs'])
-                    r_color = "#10B981" if r_idx == 0 else "#F59E0B" if r_idx == 1 else "#F97316"
-                    rhythm_box.markdown(f"<div style='background:#1E1E28; padding:20px; border-radius:8px; border-left:6px solid {r_color};'><h3 style='margin:0;color:{r_color};'>{r_labels[r_idx]}</h3><p style='margin:5px 0 0 0;color:#94A3B8;'>当前主导节律置信度: <strong style='color:#E2E8F0;'>{data['rhythm_probs'][r_idx]*100:.1f}%</strong></p></div>", unsafe_allow_html=True)
-                    
-                    # 2. 渲染 Criticality Panel
-                    c_labels = ["代偿稳态 (Stable)", "室性不稳定 (Instability)", "室性心动过速 (Sustained VT)", "极危崩溃 (VF)"]
-                    c_idx = np.argmax(data['crit_probs'])
-                    c_color = "#10B981" if c_idx == 0 else "#F59E0B" if c_idx == 1 else "#EF4444"
-                    crit_box.markdown(f"<div style='background:#1E1E28; padding:20px; border-radius:8px; border-left:6px solid {c_color};'><h3 style='margin:0;color:{c_color};'>{c_labels[c_idx]}</h3><p style='margin:5px 0 0 0;color:#94A3B8;'>血流动力学危急度: <strong style='color:#E2E8F0;'>{data['crit_probs'][c_idx]*100:.1f}%</strong></p></div>", unsafe_allow_html=True)
-                    
-                    # 3. 渲染 Hazard Panel
-                    hz = data['hazard_probs']
-                    hz_color = "#EF4444" if hz[2] > 0.5 else "#10B981"
-                    hazard_html = f"""
-                    <div style='background:#1E1E28; padding:15px 20px; border-radius:8px; border-left:6px solid {hz_color};'>
-                        <table style='width:100%; text-align:left; font-size:15px; color:#E2E8F0;'>
-                            <tr style='color:#94A3B8; border-bottom:1px solid #333;'>
-                                <th style='padding-bottom:5px;'>预测视界</th><th style='padding-bottom:5px;text-align:right;'>崩溃累积概率</th>
-                            </tr>
-                            <tr><td style='padding-top:8px;'>30 秒内</td><td style='padding-top:8px;text-align:right;color:{"#EF4444" if hz[0]>0.2 else "#10B981"};font-weight:bold;'>{hz[0]*100:.1f}%</td></tr>
-                            <tr><td style='padding-top:5px;'>1 分钟内</td><td style='padding-top:5px;text-align:right;color:{"#EF4444" if hz[1]>0.3 else "#10B981"};font-weight:bold;'>{hz[1]*100:.1f}%</td></tr>
-                            <tr><td style='padding-top:5px;'>5 分钟内</td><td style='padding-top:5px;text-align:right;color:{"#EF4444" if hz[2]>0.5 else "#10B981"};font-weight:bold;'>{hz[2]*100:.1f}%</td></tr>
-                        </table>
-                    </div>
-                    """
-                    hazard_box.markdown(hazard_html, unsafe_allow_html=True)
-                    
-            except Exception: pass
+                    # 🚀 核心修复 2：严格判断后端返回的数据格式，防止因后端没更新导致静默报错
+                    if 'rhythm' in data:
+                        rhythm_data = data.get('rhythm')
+                        crit_data = data.get('criticality')
+                        hazard_data = data.get('hazard')
+                        last_risk = hazard_data[-1] 
+                        new_traj = data.get('risk_trajectory', [])
+                    else:
+                        # 兼容老版 API 强行解析
+                        api_status_box.warning("⚠️ 检测到旧版 FastAPI 响应格式。请更新 backend 以获得完整三维输出！")
+                        rhythm_data = [data.get('normal_prob', 1.0), data.get('pvc_prob', 0.0), data.get('afib_prob', 0.0), 0.0]
+                        crit_data = [1.0 - data.get('vt_risk_5m', 0.0), 0.0, data.get('vt_risk_5m', 0.0), 0.0]
+                        hazard_data = [0.0, 0.0, data.get('vt_risk_5m', 0.0)]
+                        last_risk = data.get('vt_risk_5m', 0.0)
+                        new_traj = data.get('risk_trajectory', [])
+
+                    if len(new_traj) > 0 and new_traj != last_trajectory:
+                        last_trajectory = new_traj
+                        time_axis = np.linspace(-10, 0, len(last_trajectory))
+                        df_traj = pd.DataFrame({'Time_min': time_axis, 'Risk': last_trajectory})
+                        traj_chart = alt.Chart(df_traj).mark_area(
+                            color=alt.Gradient(gradient='linear', stops=[
+                                alt.GradientStop(color='rgba(239, 68, 68, 0.1)', offset=0), 
+                                alt.GradientStop(color='rgba(239, 68, 68, 0.8)', offset=1)
+                            ]),
+                            line={'color': '#EF4444'}
+                        ).encode(
+                            x=alt.X('Time_min:Q', axis=alt.Axis(title="过去时间 (分钟)", grid=True)), 
+                            y=alt.Y('Risk:Q', scale=alt.Scale(domain=[0, 1.0]), axis=alt.Axis(title="风险演化率", format='%'))
+                        ).properties(height=120).configure_view(strokeOpacity=0)
+                        traj_placeholder.altair_chart(traj_chart, use_container_width=True)
+                else:
+                    api_status_box.error(f"❌ 引擎连接异常 (Status Code: {resp.status_code})")
+            except Exception as e:
+                # 🚀 不再屏蔽报错，大声告诉前端出错了
+                api_status_box.error(f"❌ 推理引擎断开连接: {e}")
+        
+        metric_risk.metric("5分钟恶化概率", f"{last_risk * 100:.1f}%")
+
+        # ==========================================
+        # 🚀 升级：三维临床双语标签
+        # ==========================================
+        rhy_list = [
+            {"label": "正常稳态 (Normal)", "prob": rhythm_data[0], "color": "#10B981"},
+            {"label": "室早负荷 (PVC)", "prob": rhythm_data[1], "color": "#F59E0B"},
+            {"label": "房颤演变 (AFib)", "prob": rhythm_data[2], "color": "#F97316"},
+            {"label": "房性激惹 (SVT/AT)", "prob": rhythm_data[3], "color": "#D946EF"}
+        ]
+        
+        cri_list = [
+            {"label": "安全界限 (Safe)", "prob": crit_data[0], "color": "#10B981"},
+            {"label": "异位负荷 (PVC-Load)", "prob": crit_data[1], "color": "#F59E0B"},
+            {"label": "室速威胁 (VT)", "prob": crit_data[2], "color": "#EF4444"},
+            {"label": "心室颤动 (VF)", "prob": crit_data[3], "color": "#991B1B"}
+        ]
+        
+        haz_list = [
+            {"label": "30秒 崩溃预警", "prob": hazard_data[0], "color": "#FCA5A5"},
+            {"label": "1分钟 崩溃预警", "prob": hazard_data[1], "color": "#F87171"},
+            {"label": "5分钟 崩溃预警", "prob": hazard_data[2], "color": "#DC2626"}
+        ]
+
+        # 临床表述逻辑提取
+        cri_list_sorted = sorted(cri_list, key=lambda x: x['prob'], reverse=True)
+        primary_cri = cri_list_sorted[0]
+        for item in cri_list_sorted:
+            if item["label"] != "安全界限 (Safe)" and item["prob"] > 0.25:
+                primary_cri = item
+                break
+
+        if primary_cri["label"] == "安全界限 (Safe)":
+            diag_title = "未见急症指征"
+            diag_desc = "当前信号危急度处于安全范围。"
+            accent_color = "#10B981"
+        elif primary_cri["label"] == "异位负荷 (PVC-Load)":
+            diag_title = "室性异位搏动"
+            diag_desc = "存在室性早搏，建议关注负荷分布。"
+            accent_color = "#F59E0B"
+        elif primary_cri["label"] == "室速威胁 (VT)":
+            diag_title = "⚠️ 疑似室性心动过速"
+            diag_desc = "检测到心室快速起搏特征，存在血液动力学风险。"
+            accent_color = "#EF4444"
+        else:
+            diag_title = "🚨 极危: 心室颤动/扑动"
+            diag_desc = "生命体征即将或已经崩溃，请立即确认。"
+            accent_color = "#991B1B"
+
+        dist_html = "<div style='display: flex; flex-wrap: wrap; margin-top: 15px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 15px;'>"
+        dist_html += build_prob_column_html("🎯 节律中枢 (Rhythm)", sorted(rhy_list, key=lambda x: x['prob'], reverse=True))
+        dist_html += build_prob_column_html("🫀 危急评估 (Criticality)", cri_list_sorted)
+        dist_html += build_prob_column_html("⚠️ 生存预警 (Hazard)", haz_list)
+        dist_html += "</div>"
+            
+        current_warning_html = f"""
+        <div style="background-color: #1E1E28; padding: 20px 25px; border-radius: 8px; border-left: 8px solid {accent_color}; box-shadow: 0 4px 6px rgba(0,0,0,0.3);">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                    <h2 style="margin:0; font-size: 20px; color: {accent_color};">{diag_title}</h2>
+                    <h3 style="margin: 4px 0 0 0; font-weight: 400; font-size: 13px; color: #94A3B8;">{diag_desc}</h3>
+                </div>
+            </div>
+            {dist_html}
+        </div>
+        """
+        
+        if current_warning_html != cached_warning_html:
+            warning_box.markdown(current_warning_html, unsafe_allow_html=True)
+            cached_warning_html = current_warning_html
 
         sim_step += 1
-        time.sleep(0.08)
+        time.sleep(refresh_rate)
 else:
-    chart_placeholder.info("👈 请在左侧侧边栏启动数据推流。")
+    warning_box.info("👈 请在左侧选择病例并点击【启动数据推流】开始推演。")
+    chart_placeholder.line_chart(np.full(1000, 0.0), height=200, use_container_width=True)

@@ -11,8 +11,7 @@ py train_trajectory.py
 py build_ptbxl_factory.py
 py pretrain_cnn_ptbxl.py
 检验脚本
-py validation_multiclass.py
-py evaluate_clinical_metrics.py
+py eval_clinical.py
 上传
 .\upload.bat
 .\upload_branch.bat
