@@ -1,16 +1,14 @@
 ﻿"""
 Script: dl_model.py
-Version: V8.3 Final
+Version: V10.0 (Hierarchical Hazard Network)
 """
 import torch
 import torch.nn as nn
 
 class WindowEncoder(nn.Module):
     def __init__(self, in_channels=12, embed_dim=256):
-        super(WindowEncoder, self).__init__()
-        # 空间护城河：单导联投射
+        super().__init__()
         self.lead_projector = nn.Conv1d(1, 12, kernel_size=1, bias=False) 
-        nn.init.xavier_uniform_(self.lead_projector.weight)
         
         self.stage1 = nn.Sequential(nn.Conv1d(12, 64, kernel_size=15, stride=2, padding=7), nn.BatchNorm1d(64), nn.ReLU(), nn.MaxPool1d(kernel_size=3, stride=2, padding=1))
         self.stage2 = nn.Sequential(nn.Conv1d(64, 128, kernel_size=7, stride=2, padding=3), nn.BatchNorm1d(128), nn.ReLU(), nn.MaxPool1d(kernel_size=3, stride=2, padding=1))
@@ -18,43 +16,49 @@ class WindowEncoder(nn.Module):
         self.stage4 = nn.Sequential(nn.Conv1d(256, embed_dim, kernel_size=3, stride=2, padding=1), nn.BatchNorm1d(embed_dim), nn.ReLU(), nn.AdaptiveAvgPool1d(1))
 
     def forward(self, x):
-        if x.size(1) == 1:
-            x = self.lead_projector(x) 
-        x = self.stage1(x)
-        x = self.stage2(x)
-        x = self.stage3(x)
-        x = self.stage4(x)
-        return x.squeeze(-1)
+        if x.size(1) == 1: x = self.lead_projector(x) 
+        return self.stage4(self.stage3(self.stage2(self.stage1(x)))).squeeze(-1)
 
-class StructuredHeads(nn.Module):
+class HierarchicalHazardHeads(nn.Module):
     def __init__(self, hidden_dim=256):
-        super(StructuredHeads, self).__init__()
-        self.pvc_head = nn.Linear(hidden_dim, 1)
-        self.afib_head = nn.Linear(hidden_dim, 1)
-        self.vt_hazard_head = nn.Linear(hidden_dim, 3) 
+        super().__init__()
+        # Level 1: Rhythm Organization (0:Normal, 1:PVC, 2:AFIB, 3:SVT/AT)
+        self.rhythm_head = nn.Linear(hidden_dim, 4)
+        
+        # Level 2: Ventricular Criticality (0:Stable, 1:Instability, 2:VT, 3:VF)
+        self.criticality_head = nn.Linear(hidden_dim, 4)
+        
+        # Level 3: Discrete Cumulative Hazard (30s, 1m, 5m 增量)
+        self.hazard_deltas = nn.Linear(hidden_dim, 3) 
 
     def forward(self, h_seq):
+        rhythm_logits = self.rhythm_head(h_seq)
+        criticality_logits = self.criticality_head(h_seq)
+        
+        # 核心：累积风险单调性约束 P(30s) <= P(1m) <= P(5m)
+        raw_deltas = self.hazard_deltas(h_seq)
+        
+        p30s = torch.sigmoid(raw_deltas[..., 0])
+        p1m = p30s + (1.0 - p30s) * torch.sigmoid(raw_deltas[..., 1])
+        p5m = p1m + (1.0 - p1m) * torch.sigmoid(raw_deltas[..., 2])
+        
+        hazard_probs = torch.stack([p30s, p1m, p5m], dim=-1)
+
         return {
-            "pvc_logits": self.pvc_head(h_seq).squeeze(-1),
-            "afib_logits": self.afib_head(h_seq).squeeze(-1),
-            "vt_hazard_logits": self.vt_hazard_head(h_seq) 
+            "rhythm_logits": rhythm_logits,
+            "criticality_logits": criticality_logits,
+            "hazard_probs": hazard_probs
         }
 
-class LatentDynamicsForecastingNet(nn.Module):
-    def __init__(self, in_channels=12, seq_len=19, embed_dim=256, hidden_dim=256):
-        super(LatentDynamicsForecastingNet, self).__init__()
+class HierarchicalHazardNet(nn.Module):
+    def __init__(self, in_channels=12, embed_dim=256, hidden_dim=256):
+        super().__init__()
         self.window_encoder = WindowEncoder(in_channels, embed_dim)
-        
-        # 因果护城河：单向强制
         self.macro_gru = nn.GRU(input_size=embed_dim, hidden_size=hidden_dim, batch_first=True, bidirectional=False)
-        self.structured_heads = StructuredHeads(hidden_dim)
+        self.heads = HierarchicalHazardHeads(hidden_dim)
 
     def forward(self, x_seq):
         B, S, C, L = x_seq.shape
-        x_flat = x_seq.view(B * S, C, L)
-        z_flat = self.window_encoder(x_flat)
-        z_seq = z_flat.view(B, S, -1)
-        
+        z_seq = self.window_encoder(x_seq.view(B * S, C, L)).view(B, S, -1)
         h_seq, _ = self.macro_gru(z_seq)
-        preds = self.structured_heads(h_seq)
-        return {"preds": preds, "h_seq": h_seq}
+        return {"preds": self.heads(h_seq), "h_seq": h_seq}

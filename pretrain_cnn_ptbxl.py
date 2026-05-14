@@ -1,6 +1,6 @@
 ﻿"""
-Phase 1 - PTB-XL CNN 骨干网络预训练引擎
-仅训练 WindowEncoder，让其成为形态学特征提取大师
+Script: pretrain_cnn_ptbxl.py
+Phase 1 - PTB-XL CNN 骨干网络预训练引擎 (适配 V10.1 架构)
 """
 import torch
 import torch.nn as nn
@@ -10,23 +10,24 @@ from tqdm import tqdm
 import os
 import warnings
 
-# 导入你 V7.2 架构里现成的这双“眼睛”
+# 导入 V10 架构里全新的“眼睛”
 from dl_model import WindowEncoder 
 
 warnings.filterwarnings("ignore")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"👁️ 启动 PTB-XL 形态学宗师预训练中心... [运算核心: {device}]")
+print(f"👁️ 启动 PTB-XL 形态学宗师预训练中心 (V10 适配版)... [运算核心: {device}]")
 
-# 包装一个临时用于 5 分类的外壳
 class PretrainClassifier(nn.Module):
     def __init__(self):
         super().__init__()
-        self.encoder = WindowEncoder(in_channels=1)
+        # V10 的 WindowEncoder 默认输出 embed_dim=256
+        self.encoder = WindowEncoder(in_channels=1, embed_dim=256)
         self.head = nn.Sequential(
             nn.Dropout(0.5),
-            nn.Linear(128, 64),
+            # 🚀 核心修改：接收来自 V10 Encoder 的 256 维特征
+            nn.Linear(256, 64), 
             nn.ReLU(),
-            nn.Linear(64, 5) # 输出 5 个超级类
+            nn.Linear(64, 5) # 输出 PTB-XL 的 5 个超级类
         )
         
     def forward(self, x):
@@ -41,16 +42,13 @@ def main():
     train_data = torch.load('dataset/ptbxl_train.pt', map_location='cpu', weights_only=True)
     val_data = torch.load('dataset/ptbxl_val.pt', map_location='cpu', weights_only=True)
 
-    # 数据量大，Batch Size 可以开到 128 或 256
     train_loader = DataLoader(TensorDataset(train_data['X'], train_data['Y']), batch_size=128, shuffle=True)
     val_loader = DataLoader(TensorDataset(val_data['X'], val_data['Y']), batch_size=128, shuffle=False)
 
     model = PretrainClassifier().to(device)
     
-    # 多标签分类必须使用 BCEWithLogitsLoss
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    # 当验证集指标不再上升时，自动将学习率减半
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=3, factor=0.5)
 
     EPOCHS = 20
@@ -60,31 +58,32 @@ def main():
     for epoch in range(EPOCHS):
         model.train()
         running_loss = 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}", dynamic_ncols=True)
         
         for bx, by in pbar:
-            bx, by = bx.to(device), by.to(device)
+            # 适配 V10 的 Float16/Float32 显存策略
+            bx = bx.to(device, dtype=torch.float32) 
+            by = by.to(device, dtype=torch.float32)
+            
             optimizer.zero_grad()
             logits = model(bx)
             loss = criterion(logits, by)
             loss.backward()
-            # 加入梯度裁剪护城河，把无限大的梯度强行锁死在 1.0 以内！
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) 
             optimizer.step()
             
             running_loss += loss.item()
             pbar.set_postfix(Loss=f"{loss.item():.4f}")
             
-        # 验证环节
         model.eval()
         all_preds, all_targets = [], []
         with torch.no_grad():
             for bx, by in val_loader:
-                logits = model(bx.to(device))
+                bx = bx.to(device, dtype=torch.float32)
+                logits = model(bx)
                 all_preds.extend(torch.sigmoid(logits).cpu().numpy())
                 all_targets.extend(by.numpy())
                 
-        # 计算 5 大类的平均 AUROC (Macro AUROC)
         try:
             val_auc = roc_auc_score(all_targets, all_preds, average='macro')
         except:
@@ -96,7 +95,7 @@ def main():
         
         if val_auc > best_auc:
             best_auc = val_auc
-            # 【核心剥离操作】：只保存 encoder，把临时分类头扔进垃圾桶！
+            # 剥离 V10 版本的 Encoder 权重并保存
             torch.save(model.encoder.state_dict(), 'models/ptbxl_backbone.pth')
             print(f"🌟 新纪录！已成功剥离并保存最优底层权重至 models/ptbxl_backbone.pth")
 

@@ -1,112 +1,123 @@
 ﻿"""
 Script: train_trajectory.py
-Version: V8.3 Final (Synchronized Tensor Flow)
+Version: V10.2 (Turbo Speed + AMP + Sharded Dataloading)
 """
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.metrics import average_precision_score
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset, ConcatDataset
 from tqdm import tqdm
 import os
+import glob
+from dl_model import HierarchicalHazardNet
 
-from dl_model import LatentDynamicsForecastingNet
+# 🚀 提速黑科技 1：开启 cuDNN 自动算法寻优，对固定输入形状的 CNN 提速极大
+torch.backends.cudnn.benchmark = True 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-def load_dataset(file_path):
-    data = torch.load(file_path, map_location='cpu', weights_only=False)
-    # 返回四元组，张量维度匹配: X[B, S, 1, L], Y_pvc[B, S], Y_afib[B, S], Y_vt[B, S, 3]
-    return TensorDataset(data['X'], data['Y_pvc'], data['Y_afib'], data['Y_vt'])
-
-def discrete_survival_loss(logits, targets, pos_weight=6.0):
-    mask = (targets != -1).float()
-    bce = torch.nn.functional.binary_cross_entropy_with_logits(logits, targets.float(), reduction='none')
-    weighted_bce = bce * (1.0 + (pos_weight - 1.0) * (targets == 1).float())
-    return (weighted_bce * mask).sum() / torch.clamp(mask.sum(), min=1.0)
+def load_sharded_datasets(split_prefix):
+    shard_paths = glob.glob(f"dataset/v10_*_{split_prefix}_shard_*.pt")
+    if not shard_paths:
+        return None
+        
+    datasets = []
+    print(f"📦 正在加载 {split_prefix} 数据集，共发现 {len(shard_paths)} 个 Shard...")
+    for path in shard_paths:
+        data = torch.load(path, map_location='cpu', weights_only=False)
+        datasets.append(TensorDataset(
+            data['X'], data['Y_rhythm'], data['Y_criticality'], data['Y_hazard'],
+            data['M_rhythm'], data['M_criticality'], data['M_hazard']
+        ))
+    return ConcatDataset(datasets)
 
 def main():
-    print(f"🚀 初始化 PTFN V8.3-Final 核心动力学引擎... [Device: {device}]")
-    train_loader = DataLoader(load_dataset('dataset/ptfn_train.pt'), batch_size=8, shuffle=True)
-    val_loader = DataLoader(load_dataset('dataset/ptfn_val.pt'), batch_size=8, shuffle=False)
+    print(f"🚀 初始化 V10.2 极速演化引擎 ... [Device: {device}]")
+    
+    train_dataset = load_sharded_datasets('train')
+    val_dataset = load_sharded_datasets('val')
+    
+    if train_dataset is None:
+        print("⚠️ 未找到任何训练 Shard 文件，请先运行 build_dataset_factory.py")
+        return
 
-    model = LatentDynamicsForecastingNet().to(device)
-    backbone_path = 'models/ptbxl_backbone.pth'
-    if os.path.exists(backbone_path):
-        model.window_encoder.load_state_dict(torch.load(backbone_path, map_location=device, weights_only=True), strict=False)
+    # 🚀 提速黑科技 2：解锁多进程 CPU 搬运工，开启锁页内存 (pin_memory)
+    # 注意：Windows 下必须确保该逻辑在 main() 且被 __main__ 调用下运行
+    workers = 4 # 如果你的 CPU 是 8 核以上，可以尝试开到 6 或 8
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True, num_workers=workers, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=workers, pin_memory=True)
 
-    for param in model.window_encoder.parameters(): param.requires_grad = False
-    model.window_encoder.lead_projector.weight.requires_grad = True
+    model = HierarchicalHazardNet().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-    optimizer = torch.optim.Adam([
-        {'params': model.window_encoder.lead_projector.parameters(), 'lr': 1e-3},
-        {'params': model.macro_gru.parameters(), 'lr': 1e-4},
-        {'params': model.structured_heads.parameters(), 'lr': 1e-4}
-    ])
+    # 🚀 提速黑科技 3：初始化 AMP (自动混合精度) 梯度缩放器
+    scaler = torch.amp.GradScaler('cuda')
 
-    bce_loss_fn = nn.BCEWithLogitsLoss()
+    crit_weights = torch.tensor([1.0, 2.0, 5.0, 8.0], device=device)
+
     EPOCHS = 50
-    best_val_auprc = 0.0
+    best_loss = float('inf')
 
     for epoch in range(EPOCHS):
         model.train()
-        for name, module in model.window_encoder.named_modules():
-            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)): module.eval()
-
         running_loss = 0.0
+        valid_batches = 0
         pbar = tqdm(train_loader, desc=f"Epoch [{epoch+1:02d}/{EPOCHS}]", leave=False, dynamic_ncols=True)
         
-        # 解包 4 个张量，精准对齐
-        for bx, by_pvc_seq, by_afib_seq, by_vt_seq in pbar:
-            bx, by_pvc_seq, by_afib_seq, by_vt_seq = bx.to(device), by_pvc_seq.to(device), by_afib_seq.to(device), by_vt_seq.to(device)
-            optimizer.zero_grad()
+        for bx, y_rhy, y_cri, y_haz, m_rhy, m_cri, m_haz in pbar:
+            if torch.isnan(bx).any(): continue
             
-            out = model(bx)
-            logits_vt = out["preds"]["vt_hazard_logits"] 
-            logits_pvc = out["preds"]["pvc_logits"]
-            logits_afib = out["preds"]["afib_logits"]
+            # 转移到显卡，保持原始 dtype (Float16) 或者让 PyTorch 自己管
+            bx = bx.to(device, non_blocking=True) 
+            y_rhy = y_rhy.to(device, non_blocking=True)
+            y_cri = y_cri.to(device, non_blocking=True)
+            y_haz = y_haz.to(device, non_blocking=True)
+            m_rhy = m_rhy.to(device, non_blocking=True)
+            m_cri = m_cri.to(device, non_blocking=True)
+            m_haz = m_haz.to(device, non_blocking=True)
             
-            seq_len = logits_vt.size(1)
-            total_loss = 0
+            optimizer.zero_grad(set_to_none=True) # 比传统的 zero_grad() 更快
             
-            # 逐时间步密集推演 Loss 计算
-            for t in range(seq_len):
-                loss_vt = discrete_survival_loss(logits_vt[:, t, :], by_vt_seq[:, t, :], pos_weight=6.0)
-                loss_pvc = bce_loss_fn(logits_pvc[:, t], by_pvc_seq[:, t])
-                loss_afib = bce_loss_fn(logits_afib[:, t], by_afib_seq[:, t])
+            # 在 autocast 上下文中仅执行前向传播
+            with torch.amp.autocast('cuda'):
+                out = model(bx)["preds"]
                 
-                # 动态分配权重，主攻 VT
-                total_loss += (0.1 * loss_pvc + 0.1 * loss_afib + 1.0 * loss_vt)
+                # 取出最后时间步
+                rhythm_logits_last = out["rhythm_logits"][:, -1, :]      
+                criticality_logits_last = out["criticality_logits"][:, -1, :] 
+                hazard_probs_last = out["hazard_probs"][:, -1, :]        
+                
+            # 将 Loss 计算移出 autocast 并强转回 float32 
+            # (这是 PyTorch AMP 官方针对自定义概率 Loss 的强制安全规范，能极大地防止梯度爆炸)
+            loss_r = F.cross_entropy(rhythm_logits_last.float(), y_rhy, reduction='none')
+            loss_r = (loss_r * m_rhy).sum() / torch.clamp(m_rhy.sum(), min=1e-5)
             
-            total_loss = total_loss / seq_len
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-            optimizer.step()
+            loss_c = F.cross_entropy(criticality_logits_last.float(), y_cri, weight=crit_weights.float(), reduction='none')
+            loss_c = (loss_c * m_cri).sum() / torch.clamp(m_cri.sum(), min=1e-5)
+            
+            loss_h = F.binary_cross_entropy(hazard_probs_last.float(), y_haz.float(), reduction='none').mean(dim=-1)
+            loss_h = (loss_h * m_haz).sum() / torch.clamp(m_haz.sum(), min=1e-5)
+            
+            total_loss = 1.0 * loss_r + 1.5 * loss_c + 1.0 * loss_h
+            
+            # 使用 scaler 缩放梯度并反向传播
+            scaler.scale(total_loss).backward()
+            
+            # 梯度裁剪前需要先 unscale
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
+            
+            scaler.step(optimizer)
+            scaler.update()
             
             running_loss += total_loss.item()
+            valid_batches += 1
             pbar.set_postfix(Loss=f"{total_loss.item():>6.4f}")
             
-        model.eval()
-        val_preds, val_trues = [], []
-        with torch.no_grad():
-            for bx, _, _, by_vt_seq in val_loader:
-                bx = bx.to(device)
-                out = model(bx)
-                
-                final_logits = out["preds"]["vt_hazard_logits"][:, -1, :] 
-                hazards = 0.5 * torch.sigmoid(final_logits)
-                log_survival = torch.sum(torch.log(1.0 - hazards + 1e-6), dim=1)
-                risk_5m = 1.0 - torch.exp(log_survival)
-                
-                val_preds.extend(risk_5m.cpu().numpy())
-                is_event = (by_vt_seq[:, -1, :] == 1).any(dim=1).float()
-                val_trues.extend(is_event.numpy())
-                
-        val_auprc = average_precision_score(val_trues, val_preds) if sum(val_trues)>0 else 0
-        print(f"Epoch {epoch+1:02d} | Train Loss: {running_loss/len(train_loader):.4f} | Val AUPRC: {val_auprc:.4f}")
+        print(f"Epoch {epoch+1:02d} | Train Loss: {running_loss/max(1, valid_batches):.4f}")
         
-        if val_auprc > best_val_auprc:
-            best_val_auprc = val_auprc
-            torch.save(model.state_dict(), 'models/ptfn_v83_core.pth')
+        os.makedirs('models', exist_ok=True)
+        torch.save(model.state_dict(), 'models/ptfn_v10_core.pth')
 
 if __name__ == "__main__":
+    # 在 Windows 系统上强制要求这句入口保护，否则开启 DataLoader num_workers 会无限套娃报错
     main()
