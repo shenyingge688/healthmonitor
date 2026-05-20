@@ -9,6 +9,7 @@ import wfdb
 import time
 import pandas as pd
 import altair as alt
+from collections import deque
 from scipy import signal
 from scipy.signal import butter, filtfilt
 import os
@@ -108,7 +109,8 @@ if st.sidebar.button("🔴 启动数据推流", use_container_width=True):
     rhythm_data = [1.0, 0.0, 0.0, 0.0]
     crit_data = [1.0, 0.0, 0.0, 0.0]
     hazard_data = [0.0, 0.0, 0.0]
-    last_risk, last_trajectory = 0.0, [0.0] * 10
+    last_risk = 0.0
+    risk_history = deque([0.0] * 10, maxlen=10)  # 最近 10 次真实风险值
     cached_warning_html = ""
 
     while True:
@@ -149,26 +151,28 @@ if st.sidebar.button("🔴 启动数据推流", use_container_width=True):
                         rhythm_data = data.get('rhythm', [1.0, 0.0, 0.0, 0.0])
                         crit_data = data.get('criticality', [1.0, 0.0, 0.0, 0.0])
                         hazard_data = data.get('hazard', [0.0, 0.0, 0.0])
-                        last_risk = hazard_data[-1] 
-                        new_traj = data.get('risk_trajectory', [])
+                        last_risk = hazard_data[-1]
+                        # 真实轨迹：记录每次 API 返回的 5 分钟风险值
+                        current_risk = float(data.get('risk_trajectory', 0.0))
+                        risk_history.append(current_risk)
                     else:
                         api_status_box.warning("⚠️ 检测到旧版 FastAPI 响应格式。请更新 backend 以获得完整三维输出！")
-                        
-                    if len(new_traj) > 0 and new_traj != last_trajectory:
-                        last_trajectory = new_traj
-                        time_axis = np.linspace(-10, 0, len(last_trajectory))
-                        df_traj = pd.DataFrame({'Time_min': time_axis, 'Risk': last_trajectory})
-                        traj_chart = alt.Chart(df_traj).mark_area(
-                            color=alt.Gradient(gradient='linear', stops=[
-                                alt.GradientStop(color='rgba(239, 68, 68, 0.1)', offset=0), 
-                                alt.GradientStop(color='rgba(239, 68, 68, 0.8)', offset=1)
-                            ]),
-                            line={'color': '#EF4444'}
-                        ).encode(
-                            x=alt.X('Time_min:Q', axis=alt.Axis(title="过去时间 (分钟)", grid=True)), 
-                            y=alt.Y('Risk:Q', scale=alt.Scale(domain=[0, 1.0]), axis=alt.Axis(title="风险演化率", format='%'))
-                        ).properties(height=120).configure_view(strokeOpacity=0)
-                        traj_placeholder.altair_chart(traj_chart, use_container_width=True)
+
+                    # 绘制最近 10 次风险历史
+                    traj_list = list(risk_history)
+                    time_axis = np.linspace(-len(traj_list) + 1, 0, len(traj_list))
+                    df_traj = pd.DataFrame({'Time': time_axis, 'Risk': traj_list})
+                    traj_chart = alt.Chart(df_traj).mark_area(
+                        color=alt.Gradient(gradient='linear', stops=[
+                            alt.GradientStop(color='rgba(239, 68, 68, 0.1)', offset=0),
+                            alt.GradientStop(color='rgba(239, 68, 68, 0.8)', offset=1)
+                        ]),
+                        line={'color': '#EF4444'}
+                    ).encode(
+                        x=alt.X('Time:Q', axis=alt.Axis(title="API 调用历史 (次)", grid=True)),
+                        y=alt.Y('Risk:Q', scale=alt.Scale(domain=[0, 1.0]), axis=alt.Axis(title="5分钟风险", format='%'))
+                    ).properties(height=120).configure_view(strokeOpacity=0)
+                    traj_placeholder.altair_chart(traj_chart, use_container_width=True)
                 else:
                     api_status_box.error(f"❌ 引擎连接异常 (Status Code: {resp.status_code})")
             except Exception as e:
@@ -196,29 +200,52 @@ if st.sidebar.button("🔴 启动数据推流", use_container_width=True):
             {"label": "5分钟 崩溃预警", "prob": hazard_data[2], "color": "#DC2626"}
         ]
 
-        diag_title = "未见急症指征"
-        diag_desc = "生命体征平稳，未见明显血液动力学恶化趋势。"
-        accent_color = "#10B981" 
+        # —— 概率融合警告逻辑 ——
+        # 核心思想：条件概率 P(崩溃) = P(危急度异常) × P(5分钟风险)
+        # hazard 只有在 criticality 或 rhythm 有异常信号时才被放大
+        p_rhythm_abnormal = 1.0 - rhythm_data[0]       # 非 Normal 的概率
+        p_criticality_abnormal = 1.0 - crit_data[0]     # 非 Safe 的概率
+        p_hazard_5m = hazard_data[2]                    # 5 分钟崩溃概率
 
-        if rhythm_data[2] > 0.40:
-            diag_title = "⚠️ 心房颤动 / 节律异常"
-            diag_desc = "检测到心房异常激惹，需防范远期血栓与心衰风险。"
-            accent_color = "#F97316" 
-            
-        if crit_data[1] > 0.30:
-            diag_title = "⚠️ 显著室性异位搏动"
-            diag_desc = "室早负荷升高，可能诱发更严重的心律失常。"
-            accent_color = "#F59E0B" 
+        # 综合有效风险：条件概率融合
+        # 公式：effective_risk = P_crit_abnormal × P_hazard
+        # 这保证了正常档案即使 hazard 偶然偏高也不会触发误报
+        effective_risk = p_criticality_abnormal * p_hazard_5m
 
-        if crit_data[2] > 0.15 or crit_data[3] > 0.15:
-            diag_title = "🚨 极危: 室速/室颤发作"
-            diag_desc = "检测到致命性心律失常特征，请立即确认生命体征！"
-            accent_color = "#EF4444" 
+        # 对极端高 hazard 但无背书的兜底（防止罕见漏报）
+        if p_hazard_5m > 0.90 and effective_risk < 0.30:
+            effective_risk = 0.35
 
-        if hazard_data[2] > 0.60:
-            diag_title = "💀 警告: 系统性崩溃预兆"
-            diag_desc = f"严重预警！模型强烈提示 5 分钟内发生危及生命的临床崩溃概率达 {hazard_data[2]*100:.1f}%！"
-            accent_color = "#991B1B" 
+        # 等级映射
+        if effective_risk > 0.50:
+            diag_title = "💀 系统性崩溃预兆"
+            diag_desc = f"危急度异常概率 {p_criticality_abnormal*100:.0f}% × 5分钟风险 {p_hazard_5m*100:.0f}% → 综合风险极高。请立即确认生命体征！"
+            accent_color = "#991B1B"
+        elif effective_risk > 0.25:
+            diag_title = "🚨 极危: 室速/室颤威胁"
+            diag_desc = f"检测到高危急度信号与显著短期崩溃风险。综合风险评分: {effective_risk*100:.1f}%"
+            accent_color = "#EF4444"
+        elif effective_risk > 0.10:
+            if rhythm_data[2] > 0.30:
+                diag_title = "⚠️ 心房颤动 / 节律异常"
+                diag_desc = "检测到心房异常激惹，需防范远期血栓与心衰风险。"
+                accent_color = "#F97316"
+            elif crit_data[1] > 0.30:
+                diag_title = "⚠️ 显著室性异位搏动"
+                diag_desc = "室早负荷升高，可能诱发更严重的心律失常。"
+                accent_color = "#F59E0B"
+            else:
+                diag_title = "⚠️ 轻度异常信号"
+                diag_desc = "节律或危急度出现轻微偏离，建议持续观察。"
+                accent_color = "#F59E0B"
+        elif effective_risk > 0.03:
+            diag_title = "⚡ 轻微异位搏动"
+            diag_desc = "偶发异位心搏，生命体征总体平稳，继续监测。"
+            accent_color = "#3B82F6"
+        else:
+            diag_title = "未见急症指征"
+            diag_desc = "生命体征平稳，未见明显血液动力学恶化趋势。"
+            accent_color = "#10B981"
 
         dist_html = "<div style='display: flex; flex-wrap: wrap; margin-top: 15px; border-top: 1px solid rgba(255,255,255,0.1); padding-top: 15px;'>"
         dist_html += build_prob_column_html("🎯 节律中枢 (Rhythm)", sorted(rhy_list, key=lambda x: x['prob'], reverse=True))

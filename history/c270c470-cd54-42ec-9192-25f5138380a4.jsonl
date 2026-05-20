@@ -1,0 +1,2 @@
+{"type": "user_input", "text": "你是谁", "images": [], "ts": 1778813620.3140845, "checkpoint": null}
+{"type": "error", "message": "claude CLI not found in PATH"}

@@ -1,0 +1,4 @@
+{"type": "user_input", "text": "1", "images": [], "ts": 1778776290.3573904, "checkpoint": null}
+{"type": "error", "message": "claude CLI not found in PATH"}
+{"type": "user_input", "text": "1", "images": [], "ts": 1778776292.276846, "checkpoint": null}
+{"type": "error", "message": "claude CLI not found in PATH"}

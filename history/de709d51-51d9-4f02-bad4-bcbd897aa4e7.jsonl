@@ -1,0 +1,2 @@
+{"type": "user_input", "text": "帮我审查当前目录的代码质量，重点关注：代码风格、潜在 bug、安全问题。请先用 Glob 列出所有源文件。", "images": [], "ts": 1778775177.3606653, "checkpoint": {"type": "git", "head": "9dbd8e6cc8f220aa49480de3224fa2d2472922fc", "stash": "fc71f49eb7a5653aa0f5f85a9c1777995af54c46"}}
+{"type": "error", "message": "claude CLI not found in PATH"}
