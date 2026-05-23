@@ -1,6 +1,6 @@
 """
 Script: build_dataset_factory.py
-Version: V10.2 (Fixed Stride + Bounded Oversampling + Safe Augmentations)
+Version: V13 (Decontaminated Hazard + PVC-Load Rescue + Wider PVC Window)
 """
 import wfdb
 import numpy as np
@@ -108,8 +108,8 @@ def parse_ucso_annotations(annotation, target_fs, total_pts):
             last_idx = sample_idx
 
         if sym in ['V', 'E']:
-            # 扩大 PVC 标注窗口：±375 samples (1.5s @ 250Hz)，增加 30s 窗口捕获概率
-            region = rhythm_timeline[max(0, sample_idx - 375):min(total_pts, sample_idx + 375)]
+            # PVC 标注窗口：±1125 samples (4.5s @ 250Hz)，覆盖完整 30s 窗口
+            region = rhythm_timeline[max(0, sample_idx - 1125):min(total_pts, sample_idx + 1125)]
             region[region == 0] = 1
 
     rhythm_timeline[last_idx:] = current_rhythm
@@ -122,9 +122,9 @@ def extract_hierarchical_labels(rhythm_timeline, crit_timeline, win_end, db_sour
     current_crit = crit_timeline[win_end - 1]
 
     if current_crit == 0:
-        win_start = max(0, win_end - TARGET_FS * 10)
+        win_start = max(0, win_end - TARGET_FS * 30)
         pvc_ratio = np.mean(rhythm_timeline[win_start:win_end] == 1)
-        if pvc_ratio > 0.3:
+        if pvc_ratio > 0.15:
             current_crit = 1
 
     hazard_labels = []
@@ -137,15 +137,19 @@ def extract_hierarchical_labels(rhythm_timeline, crit_timeline, win_end, db_sour
     mask_rhythm, mask_crit, mask_hazard = 1.0, 1.0, 1.0
     db = db_source.lower()
     if 'mitdb' in db:
-        mask_rhythm, mask_crit, mask_hazard = 1.0, 1.0, 0.3
+        mask_rhythm, mask_crit, mask_hazard = 1.0, 1.0, 0.7
     elif 'afdb' in db:
         mask_rhythm, mask_crit, mask_hazard = 1.0, 0.0, 0.0
     elif 'vfdb' in db or 'cudb' in db:
         mask_rhythm, mask_crit, mask_hazard = 0.0, 1.0, 1.0
     elif 'svdb' in db:
-        mask_rhythm, mask_crit, mask_hazard = 1.0, 1.0, 0.3
+        mask_rhythm, mask_crit, mask_hazard = 1.0, 1.0, 0.7
     elif 'ptbxl' in db:
         mask_rhythm, mask_crit, mask_hazard = 1.0, 0.0, 0.0
+
+    # 当前已发作 VT/VF → 弱梯度参与，保留注意力对危机形态的感知
+    if current_crit >= 2:
+        mask_hazard = 0.2
 
     return current_rhythm, current_crit, hazard_labels, mask_rhythm, mask_crit, mask_hazard
 
@@ -256,7 +260,7 @@ def build_v10_dataset(record_list, name, db_source):
 
 
 if __name__ == '__main__':
-    print("V10.2 data pipeline (fixed stride + bounded oversampling)")
+    print("V13 data pipeline (hazard decontamination + PVC-load rescue)")
     target_databases = ['mitdb', 'afdb', 'vfdb', 'cudb', 'svdb']
 
     for db_name in target_databases:
@@ -274,5 +278,5 @@ if __name__ == '__main__':
             random.shuffle(recs)
             split = int(0.8 * len(recs))
 
-            build_v10_dataset(recs[:split], f'v10_{db_name}_train', db_source=db_name)
-            build_v10_dataset(recs[split:], f'v10_{db_name}_val', db_source=db_name)
+            build_v10_dataset(recs[:split], f'v13_{db_name}_train', db_source=db_name)
+            build_v10_dataset(recs[split:], f'v13_{db_name}_val', db_source=db_name)

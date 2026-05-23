@@ -1,6 +1,6 @@
 """
 Script: backend.py
-Version: V10.4 (Inference Dimension Fix & Window-Level Normalization)
+Version: V13 (Dual Attention Inference)
 """
 import sys
 import uvicorn

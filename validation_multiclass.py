@@ -1,5 +1,5 @@
 """
-validation_multiclass.py — 全量多层级临床验证 (V11)
+validation_multiclass.py — 全量多层级临床验证 (V13)
 
 评估内容:
   1. Rhythm (4-class)          混淆矩阵 + per-class P/R/F1 + OVR AUC
@@ -37,7 +37,7 @@ os.makedirs("results", exist_ok=True)
 
 # =========================================================
 def load_sharded_datasets(split_prefix="val"):
-    shard_paths = glob.glob(f"dataset/v10_*_{split_prefix}_shard_*.pt")
+    shard_paths = glob.glob(f"dataset/v13_*_{split_prefix}_shard_*.pt")
     datasets = []
     names = [__import__('os').path.basename(p) for p in shard_paths]
     print(f"  found {len(shard_paths)} shards: {names}")
@@ -113,7 +113,7 @@ def plot_roc(y_true, y_score, label, path):
 @torch.inference_mode()
 def main():
     print("=" * 60)
-    print("V11 Multi-Level Clinical Validation")
+    print("V13 Multi-Level Clinical Validation")
     print("=" * 60)
 
     val_dataset = load_sharded_datasets("val")

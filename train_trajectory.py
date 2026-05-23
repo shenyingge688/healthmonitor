@@ -1,6 +1,6 @@
 """
 Script: train_trajectory.py
-Version: V11.0 (Single-Stage Training — no curriculum, no GRU pollution)
+Version: V13.0 (Focal BCE Hazard + Extended Epochs + Early Stopping)
 """
 import os
 import gc
@@ -24,13 +24,13 @@ from sklearn.metrics import (
 from dl_model import HierarchicalHazardNet
 
 # =========================================================
-torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.benchmark = False  # 关闭算法搜索，减少内存碎片
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # =========================================================
 def load_sharded_datasets(split_prefix):
-    shard_paths = glob.glob(f"dataset/v10_*_{split_prefix}_shard_*.pt")
+    shard_paths = glob.glob(f"dataset/v13_*_{split_prefix}_shard_*.pt")
     if not shard_paths:
         return None
     datasets = []
@@ -69,9 +69,14 @@ class ClassBalancedFocalLoss(nn.Module):
         return ((1 - pt) ** self.gamma) * ce
 
 
-def label_smoothing_bce_loss(probs, targets, eps=0.1):
-    targets_smooth = targets * (1.0 - 2.0 * eps) + eps
-    return F.binary_cross_entropy(probs, targets_smooth, reduction="none")
+def focal_bce_loss(probs, targets, gamma=1.0):
+    """Focal BCE — 聚焦难例（真正的 Safe→Hazard 前兆），降权易例（已发作/crisis）。"""
+    eps = 1e-7
+    probs = probs.clamp(eps, 1.0 - eps)
+    ce = F.binary_cross_entropy(probs, targets, reduction="none")
+    pt = torch.where(targets > 0.5, probs, 1.0 - probs)
+    focal_weight = (1.0 - pt).pow(gamma)
+    return focal_weight * ce
 
 
 # =========================================================
@@ -99,8 +104,7 @@ def lr_lambda(step, warmup=1500, total=60000):
 
 # =========================================================
 def train_one_epoch(epoch, total_epochs, model, ema, loader, optimizer,
-                    scheduler, scaler, rhy_loss_fn, cri_weights,
-                    hazard_smooth_eps, step_counter):
+                    scheduler, scaler, rhy_loss_fn, cri_weights, step_counter):
     model.train()
     total_loss = 0.0
     valid_batches = 0
@@ -145,9 +149,7 @@ def train_one_epoch(epoch, total_epochs, model, ema, loader, optimizer,
         )
         loss_c = (loss_c_raw * m_cri).sum() / m_cri.sum().clamp_min(1e-6)
 
-        loss_h_raw = label_smoothing_bce_loss(
-            safe_hazard, y_haz.float(), eps=hazard_smooth_eps
-        ).mean(dim=-1)
+        loss_h_raw = focal_bce_loss(safe_hazard, y_haz.float()).mean(dim=-1)
         loss_h = (loss_h_raw * m_haz).sum() / m_haz.sum().clamp_min(1e-6)
 
         total = 1.0 * loss_r + 1.5 * loss_c + 1.0 * loss_h
@@ -168,6 +170,9 @@ def train_one_epoch(epoch, total_epochs, model, ema, loader, optimizer,
             valid_batches += 1
             step_counter[0] += 1
 
+        if batch_idx % 100 == 0 and batch_idx > 0:
+            torch.cuda.empty_cache()
+
         elapsed = time.time() - start_time
         avg_time = elapsed / max(batch_idx + 1, 1)
         remain = avg_time * (len(loader) - batch_idx - 1)
@@ -187,7 +192,7 @@ def train_one_epoch(epoch, total_epochs, model, ema, loader, optimizer,
 
 # =========================================================
 @torch.inference_mode()
-def validate(model, loader, rhy_loss_fn, cri_weights, hazard_smooth_eps):
+def validate(model, loader, rhy_loss_fn, cri_weights):
     model.eval()
     total_loss = 0.0
     n = 0
@@ -227,9 +232,7 @@ def validate(model, loader, rhy_loss_fn, cri_weights, hazard_smooth_eps):
         )
         loss_c = (loss_c_raw * m_cri).sum() / m_cri.sum().clamp_min(1e-6)
 
-        loss_h_raw = label_smoothing_bce_loss(
-            safe_hazard, y_haz.float(), eps=hazard_smooth_eps
-        ).mean(dim=-1)
+        loss_h_raw = focal_bce_loss(safe_hazard, y_haz.float()).mean(dim=-1)
         loss_h = (loss_h_raw * m_haz).sum() / m_haz.sum().clamp_min(1e-6)
 
         total_loss += (1.0 * loss_r + 1.5 * loss_c + 1.0 * loss_h).item()
@@ -276,7 +279,7 @@ def validate(model, loader, rhy_loss_fn, cri_weights, hazard_smooth_eps):
 # =========================================================
 def main():
     print("=" * 72)
-    print(f"V11.0 Single-Stage Training | Device = {device}")
+    print(f"V13.0 Dual-Attention Training | Device = {device}")
     print("=" * 72)
 
     train_dataset = load_sharded_datasets("train")
@@ -285,18 +288,19 @@ def main():
         print("No training data found. Run build_dataset_factory.py first.")
         return
 
-    BATCH_SIZE = 32  # TemporalConv 轻量化后可加大批次
-    EPOCHS = 25  # 数据更均衡后收敛更快
-    HAZARD_SMOOTH_EPS = 0.1
+    BATCH_SIZE = 10
+    EPOCHS = 50
     FOCAL_GAMMA = 2.0
+    HAZARD_FOCAL_GAMMA = 1.0
+    EARLY_STOP_PATIENCE = 15
 
     train_loader = DataLoader(
         train_dataset, batch_size=BATCH_SIZE, shuffle=True,
-        num_workers=0, pin_memory=True, drop_last=True,
+        num_workers=0, pin_memory=False, drop_last=False,
     )
     val_loader = DataLoader(
         val_dataset, batch_size=BATCH_SIZE, shuffle=False,
-        num_workers=0, pin_memory=True,
+        num_workers=0, pin_memory=False,
     )
 
     print(f"Train: {len(train_dataset)}  |  Val: {len(val_dataset)}")
@@ -308,7 +312,7 @@ def main():
     print(f"Rhythm      counts: {rhy_counts.int().tolist()}")
     print(f"Criticality counts: {cri_counts.int().tolist()}")
     rhy_weights = torch.tensor([0.5, 3.0, 1.0, 2.0], device=device)
-    cri_weights = torch.tensor([0.3, 2.0, 4.0, 6.0], device=device)
+    cri_weights = torch.tensor([0.3, 2.0, 3.0, 4.0], device=device)
     print(f"  → weights (clinical fixed): R={rhy_weights.tolist()}  C={cri_weights.tolist()}")
 
     # ---- Model ----
@@ -317,8 +321,11 @@ def main():
     if os.path.exists(backbone_path):
         print("Loading PTBXL backbone...")
         backbone = torch.load(backbone_path, map_location=device, weights_only=True)
-        model.window_encoder.load_state_dict(backbone)
-        print("Backbone loaded.")
+        missing, unexpected = model.window_encoder.load_state_dict(backbone, strict=False)
+        if missing:
+            print(f"  V12 架构变更，backbone 不兼容 ({len(missing)} keys)，从零训练")
+        else:
+            print("  Backbone loaded.")
 
     ema = EMA(model)
     scaler = torch.amp.GradScaler("cuda")
@@ -326,7 +333,7 @@ def main():
     step_counter = [0]
     os.makedirs("models", exist_ok=True)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=3e-4)
     total_steps = len(train_loader) * EPOCHS
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
@@ -334,6 +341,8 @@ def main():
     )
 
     best_clinical_score = -1.0
+    best_epoch = 0
+    no_improve_count = 0
     save_path = "models/v10_master_best.pth"
 
     for epoch in range(1, EPOCHS + 1):
@@ -341,22 +350,23 @@ def main():
 
         train_loss = train_one_epoch(
             epoch, EPOCHS, model, ema, train_loader, optimizer,
-            scheduler, scaler, rhy_loss_fn, cri_weights,
-            HAZARD_SMOOTH_EPS, step_counter,
+            scheduler, scaler, rhy_loss_fn, cri_weights, step_counter,
         )
-        val_metrics = validate(ema.shadow, val_loader, rhy_loss_fn, cri_weights, HAZARD_SMOOTH_EPS)
+        val_metrics = validate(ema.shadow, val_loader, rhy_loss_fn, cri_weights)
 
         epoch_time = time.time() - epoch_start
         temp_val = model.heads.hazard_temperature.item()
-        clinical_score = 0.3 * val_metrics["rhythm_acc"] + 0.3 * val_metrics["crit_f1"] + 0.4 * val_metrics["hazard_auprc"]
+        clinical_score = 0.4 * val_metrics["rhythm_acc"] + 0.4 * val_metrics["crit_f1"] + 0.2 * val_metrics["hazard_auprc"]
 
         print(f"\nEpoch [{epoch:02d}/{EPOCHS}] | {epoch_time / 60:.1f}m")
         print(f"  Train Loss: {train_loss:.4f}  |  Val Loss: {val_metrics['loss']:.4f}")
         print(f"  Rhythm Acc: {val_metrics['rhythm_acc']:.4f}  |  Crit F1: {val_metrics['crit_f1']:.4f}  |  Hazard AUPRC: {val_metrics['hazard_auprc']:.4f}")
         print(f"  Temp: {temp_val:.3f}  |  Clinical Score: {clinical_score:.4f}")
 
-        if clinical_score > best_clinical_score:
+        if clinical_score > best_clinical_score + 1e-4:
             best_clinical_score = clinical_score
+            best_epoch = epoch
+            no_improve_count = 0
             torch.save({
                 "model": model.state_dict(),
                 "ema": ema.shadow.state_dict(),
@@ -368,11 +378,18 @@ def main():
                 "metrics": val_metrics,
             }, save_path)
             print(f"  -> saved (clinical={best_clinical_score:.4f})")
+        else:
+            no_improve_count += 1
+            print(f"  -> no improvement ({no_improve_count}/{EARLY_STOP_PATIENCE})")
+
+        if no_improve_count >= EARLY_STOP_PATIENCE:
+            print(f"\nEarly stopping at epoch {epoch} (best: {best_epoch} with score {best_clinical_score:.4f})")
+            break
 
         gc.collect()
         torch.cuda.empty_cache()
 
-    print(f"\nDone. Best clinical score: {best_clinical_score:.4f}  ->  {save_path}")
+    print(f"\nDone. Best clinical score: {best_clinical_score:.4f} @ epoch {best_epoch}  ->  {save_path}")
 
 
 if __name__ == "__main__":
