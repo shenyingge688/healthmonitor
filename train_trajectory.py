@@ -306,13 +306,14 @@ def main():
     print(f"Train: {len(train_dataset)}  |  Val: {len(val_dataset)}")
 
     # ---- 临床固定权重 ----
-    # Class-Balanced 公式在样本量 >1000 时 β^n≈0，所有大类权重相同，无法区分
-    # 改用临床动机权重：重罚 VT(4x)/VF(6x)，适度提升 PVC(3x)/SVT(2x)
+    # PVC 标签修复后样本量从 ~0 增至 6474，高权重不再必要，降至 2.0
+    # Normal 从 0.3→1.0，避免对正常心搏过于"宽容"
+    # AFib 从 1.0→2.0，增强与 PVC 的边界竞争能力
     rhy_counts, cri_counts = compute_class_counts_from_dataset(train_dataset)
     print(f"Rhythm      counts: {rhy_counts.int().tolist()}")
     print(f"Criticality counts: {cri_counts.int().tolist()}")
-    rhy_weights = torch.tensor([0.3, 5.0, 1.0, 4.0], device=device)
-    cri_weights = torch.tensor([0.2, 3.0, 4.0, 6.0], device=device)
+    rhy_weights = torch.tensor([1.0, 2.0, 2.0, 4.0], device=device)  # Normal,PVC,AFib,SVT/AT
+    cri_weights = torch.tensor([0.2, 3.0, 4.0, 6.0], device=device)  # Safe,PVC-Load,VT,VF
     print(f"  → weights (clinical fixed): R={rhy_weights.tolist()}  C={cri_weights.tolist()}")
 
     # ---- Model ----
