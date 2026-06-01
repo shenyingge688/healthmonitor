@@ -101,7 +101,7 @@ class HierarchicalHazardNet(nn.Module):
         self.crit_attention_query = nn.Linear(hidden_dim, 1, bias=False)
         self.haz_attention_query = nn.Linear(hidden_dim, 1, bias=False)
 
-        self.dropout = nn.Dropout(0.1)
+        self.dropout = nn.Dropout(0.2)
 
         self.heads = HierarchicalHazardHeads(hidden_dim)
 

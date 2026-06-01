@@ -1,0 +1,15 @@
+前端
+py -m streamlit run dashboard.py
+
+后端
+py -m uvicorn main:app --reload
+
+提取数据
+py build_dataset_factory.py
+训练模型
+py train_massive_v5.py
+
+py validation_v5_pro.py
+上传
+.\upload.bat
+.\upload_branch.bat

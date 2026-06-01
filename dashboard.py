@@ -151,10 +151,7 @@ if st.sidebar.button("🔴 启动数据推流", use_container_width=True):
                         rhythm_data = data.get('rhythm', [1.0, 0.0, 0.0, 0.0])
                         crit_data = data.get('criticality', [1.0, 0.0, 0.0, 0.0])
                         hazard_data = data.get('hazard', [0.0, 0.0, 0.0])
-                        last_risk = hazard_data[-1]
-                        # 真实轨迹：记录每次 API 返回的 5 分钟风险值
-                        current_risk = float(data.get('risk_trajectory', 0.0))
-                        risk_history.append(current_risk)
+                        risk_history.append(hazard_data[-1])
                     else:
                         api_status_box.warning("⚠️ 检测到旧版 FastAPI 响应格式。请更新 backend 以获得完整三维输出！")
 
@@ -178,7 +175,7 @@ if st.sidebar.button("🔴 启动数据推流", use_container_width=True):
             except Exception as e:
                 api_status_box.error(f"❌ 推理引擎断开连接: {e}")
         
-        metric_risk.metric("5分钟恶化概率", f"{last_risk * 100:.1f}%")
+        metric_risk.metric("5分钟恶化概率", f"{hazard_data[-1] * 100:.1f}%")
 
         rhy_list = [
             {"label": "正常稳态 (Normal)", "prob": rhythm_data[0], "color": "#10B981"},
@@ -200,17 +197,11 @@ if st.sidebar.button("🔴 启动数据推流", use_container_width=True):
             {"label": "5分钟 崩溃预警", "prob": hazard_data[2], "color": "#DC2626"}
         ]
 
-        # —— 概率融合警告逻辑 ——
-        # 核心思想：条件概率 P(崩溃) = P(危急度异常) × P(5分钟风险)
-        # hazard 只有在 criticality 或 rhythm 有异常信号时才被放大
-        p_rhythm_abnormal = 1.0 - rhythm_data[0]       # 非 Normal 的概率
-        p_criticality_abnormal = 1.0 - crit_data[0]     # 非 Safe 的概率
-        p_hazard_5m = hazard_data[2]                    # 5 分钟崩溃概率
-
-        # 综合有效风险：条件概率融合
-        # 公式：effective_risk = P_crit_abnormal × P_hazard
-        # 这保证了正常档案即使 hazard 偶然偏高也不会触发误报
-        effective_risk = p_criticality_abnormal * p_hazard_5m
+        # —— 严重度加权融合 (与 validation_multiclass.py 对齐) ——
+        # severity_weight = PVC-Load×0.3 + VT×0.7 + VF×1.0
+        severity_weight = (crit_data[1] * 0.3 + crit_data[2] * 0.7 + crit_data[3] * 1.0)
+        p_hazard_5m = hazard_data[2]
+        effective_risk = severity_weight * p_hazard_5m
 
         # 对极端高 hazard 但无背书的兜底（防止罕见漏报）
         if p_hazard_5m > 0.90 and effective_risk < 0.30:
@@ -219,7 +210,7 @@ if st.sidebar.button("🔴 启动数据推流", use_container_width=True):
         # 等级映射
         if effective_risk > 0.50:
             diag_title = "💀 系统性崩溃预兆"
-            diag_desc = f"危急度异常概率 {p_criticality_abnormal*100:.0f}% × 5分钟风险 {p_hazard_5m*100:.0f}% → 综合风险极高。请立即确认生命体征！"
+            diag_desc = f"严重度加权 {severity_weight*100:.0f}% × 5分钟风险 {p_hazard_5m*100:.0f}% → 综合风险极高。请立即确认生命体征！"
             accent_color = "#991B1B"
         elif effective_risk > 0.25:
             diag_title = "🚨 极危: 室速/室颤威胁"
@@ -268,6 +259,25 @@ if st.sidebar.button("🔴 启动数据推流", use_container_width=True):
         if current_warning_html != cached_warning_html:
             warning_box.markdown(current_warning_html, unsafe_allow_html=True)
             cached_warning_html = current_warning_html
+            # 记录事件日志
+            if effective_risk > 0.10:
+                ts = f"{int(cur_sec // 60):02d}:{int(cur_sec % 60):02d}"
+                st.session_state.anomaly_logs.append({
+                    "time": ts, "risk": f"{effective_risk*100:.1f}%",
+                    "title": diag_title,
+                })
+                # 只保留最近 20 条
+                if len(st.session_state.anomaly_logs) > 20:
+                    st.session_state.anomaly_logs = st.session_state.anomaly_logs[-20:]
+                # 更新日志显示
+                log_html = "<div style='max-height:300px;overflow-y:auto;'>"
+                for e in reversed(st.session_state.anomaly_logs):
+                    log_html += f"<div style='padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.05);font-size:12px;color:#94A3B8;'>"
+                    log_html += f"<span style='color:#F59E0B;font-family:monospace;'>{e['time']}</span> "
+                    log_html += f"<span style='color:#EF4444;'>{e['risk']}</span> — {e['title']}"
+                    log_html += "</div>"
+                log_html += "</div>"
+                log_placeholder.markdown(log_html, unsafe_allow_html=True)
 
         sim_step += 1
         time.sleep(refresh_rate)

@@ -87,8 +87,11 @@ def parse_ucso_annotations(annotation, target_fs, total_pts):
             break
 
         if isinstance(aux, str) and aux.startswith('('):
-            rhythm_timeline[last_idx:sample_idx] = current_rhythm
-            crit_timeline[last_idx:sample_idx] = current_crit
+            # 仅在非 Normal 节律时填充间隙，保留搏动级 PVC 标记 (class 1)
+            if current_rhythm != 0:
+                rhythm_timeline[last_idx:sample_idx] = current_rhythm
+            if current_crit != 0:
+                crit_timeline[last_idx:sample_idx] = current_crit
             note = aux.upper()
 
             if 'AFIB' in note:
@@ -112,8 +115,16 @@ def parse_ucso_annotations(annotation, target_fs, total_pts):
             region = rhythm_timeline[max(0, sample_idx - 1125):min(total_pts, sample_idx + 1125)]
             region[region == 0] = 1
 
-    rhythm_timeline[last_idx:] = current_rhythm
-    crit_timeline[last_idx:] = current_crit
+        # 心房起源搏动: A(房早), a(差传房早), S(室上早), J(交界早)
+        # 标记为 rhythm class 1，指示心房激惹信号
+        if sym in ['A', 'a', 'S', 'J']:
+            region = rhythm_timeline[max(0, sample_idx - 1125):min(total_pts, sample_idx + 1125)]
+            region[region == 0] = 1
+
+    if current_rhythm != 0:
+        rhythm_timeline[last_idx:] = current_rhythm
+    if current_crit != 0:
+        crit_timeline[last_idx:] = current_crit
     return rhythm_timeline, crit_timeline
 
 
@@ -191,6 +202,16 @@ def build_v10_dataset(record_list, name, db_source):
             rhy_timeline, cri_timeline = parse_ucso_annotations(
                 annotation, TARGET_FS, len(ecg)
             )
+
+            # SVT/AT 节律窗口扩展: aux_note 仅标记节律起始点，扩展至后续 60s
+            # (借鉴 V3.0 AFib 扩展经验 — 解决 SVTA/AT/AFL 标注稀疏问题)
+            is_svt = rhy_timeline == 3
+            if is_svt.any():
+                svt_ends = np.where(is_svt[:-1] & ~is_svt[1:])[0]
+                for end_pos in svt_ends:
+                    end_s = min(len(rhy_timeline), end_pos + 15000)  # 60s @ 250Hz
+                    region = rhy_timeline[end_pos:end_s]
+                    region[region == 0] = 3
 
             current_pt = 0
             max_pt = len(ecg) - HISTORY_SEC * TARGET_FS

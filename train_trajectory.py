@@ -288,7 +288,7 @@ def main():
         print("No training data found. Run build_dataset_factory.py first.")
         return
 
-    BATCH_SIZE = 10
+    BATCH_SIZE = 16
     EPOCHS = 50
     FOCAL_GAMMA = 2.0
     HAZARD_FOCAL_GAMMA = 1.0
@@ -311,8 +311,8 @@ def main():
     rhy_counts, cri_counts = compute_class_counts_from_dataset(train_dataset)
     print(f"Rhythm      counts: {rhy_counts.int().tolist()}")
     print(f"Criticality counts: {cri_counts.int().tolist()}")
-    rhy_weights = torch.tensor([0.5, 3.0, 1.0, 2.0], device=device)
-    cri_weights = torch.tensor([0.3, 2.0, 3.0, 4.0], device=device)
+    rhy_weights = torch.tensor([0.3, 5.0, 1.0, 4.0], device=device)
+    cri_weights = torch.tensor([0.2, 3.0, 4.0, 6.0], device=device)
     print(f"  → weights (clinical fixed): R={rhy_weights.tolist()}  C={cri_weights.tolist()}")
 
     # ---- Model ----
@@ -333,7 +333,7 @@ def main():
     step_counter = [0]
     os.makedirs("models", exist_ok=True)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=3e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=5e-4)
     total_steps = len(train_loader) * EPOCHS
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
@@ -356,7 +356,7 @@ def main():
 
         epoch_time = time.time() - epoch_start
         temp_val = model.heads.hazard_temperature.item()
-        clinical_score = 0.4 * val_metrics["rhythm_acc"] + 0.4 * val_metrics["crit_f1"] + 0.2 * val_metrics["hazard_auprc"]
+        clinical_score = 0.35 * val_metrics["rhythm_acc"] + 0.35 * val_metrics["crit_f1"] + 0.3 * val_metrics["hazard_auprc"]
 
         print(f"\nEpoch [{epoch:02d}/{EPOCHS}] | {epoch_time / 60:.1f}m")
         print(f"  Train Loss: {train_loss:.4f}  |  Val Loss: {val_metrics['loss']:.4f}")
