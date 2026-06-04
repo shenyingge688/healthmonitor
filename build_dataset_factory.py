@@ -1,6 +1,13 @@
 """
 Script: build_dataset_factory.py
-Version: 3-class Rhythm (SVT/AT merged into AFIB) + Waveform Hazard
+超前 5 分钟心律失常预测数据集构建引擎
+
+预测范式: 输入过去 10 分钟 ECG → 预测未来 5 分钟最严重节律
+
+数据策略:
+  - MIT-BIH 全量为主力 (~39 条训练记录)
+  - AFDB / VFDB / CUDB / SVDB 少量补充 (各 2~3 条，弥补长程 AF 和危重 VT/VF 样本)
+  - 训练/验证/演示三集完全隔离，防止数据泄露
 """
 import wfdb
 import numpy as np
@@ -17,26 +24,37 @@ SAVE_DIR = os.path.join(BASE_DIR, 'dataset')
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 TARGET_FS = 250
-HISTORY_SEC = 300
-WINDOW_SEC = 30
-OVERLAP_STRIDE_SEC = 15
-N_WINDOWS = (HISTORY_SEC - WINDOW_SEC) // OVERLAP_STRIDE_SEC + 1
-PTS_PER_WIN = WINDOW_SEC * TARGET_FS
-HAZARD_WINDOWS_SEC = [30, 60, 300]
+HISTORY_SEC = 600          # 输入: 过去 10 分钟
+PREDICT_SEC = 300          # 预测窗口: 未来 5 分钟
+WINDOW_SEC = 30            # 单窗口时长
+OVERLAP_STRIDE_SEC = 15    # 窗口步长
+N_WINDOWS = (HISTORY_SEC - WINDOW_SEC) // OVERLAP_STRIDE_SEC + 1  # 39
+PTS_PER_WIN = WINDOW_SEC * TARGET_FS  # 7500
 
 SHARD_SIZE = 2500
-
-# Bounded oversampling -- each sample repeated up to max_repeats with safe augmentations
 FIXED_STRIDE_SEC = 10
-# 数据库特定步长 — afdb 样本过量 (10h records)，加大步长降采样
-DB_STRIDE_OVERRIDE = {"afdb": 50}
-# 节律过采样倍数（3 类：Normal, PVC, 室上性心律失常）
-MAX_REPEATS_RHY = {0: 1, 1: 2, 2: 4}
-# 危急度过采样倍数（VF 8x，对抗严重样本稀疏）
-MAX_REPEATS_CRI = {0: 1, 1: 2, 2: 4, 3: 8}
+DB_STRIDE_OVERRIDE = {"afdb": 50}  # AFDB 长程记录降采样
+
+# 过采样倍数 (6 类)
+MAX_REPEATS = {0: 1, 1: 2, 2: 4, 3: 8, 4: 4, 5: 4}
+
+# ---- 完全隔离的数据集划分 ----
+DEMO_CASES = {'mitdb': ['100', '119', '209', '201', '207']}
+
+VAL_MITDB = ['102', '104', '107', '217']
+
+SUPPLEMENT_RECORDS = {
+    'afdb': ['04043', '04936'],
+    'vfdb': ['422', '423', '426'],
+    'cudb': ['cu01'],
+    'svdb': ['800'],
+}
 
 
-# ---------- safe augmentations ----------
+# =========================================================
+# 数据增强
+# =========================================================
+
 def safe_baseline_wander(x, fs=250, max_amp=0.15):
     t = np.arange(len(x)) / fs
     freq = np.random.uniform(0.1, 0.5)
@@ -52,24 +70,6 @@ def safe_gain_scaling(x, scale_range=(0.9, 1.1)):
     return x * np.random.uniform(*scale_range)
 
 
-def cutmix_vf(x_norm, vf_pool):
-    """VF CutMix: blend a random VF segment into current window.
-    x_norm: [7500] ECG window. vf_pool: list of VF segments of similar length.
-    Returns augmented window or original if pool is empty."""
-    if not vf_pool:
-        return x_norm
-    vf_seg = vf_pool[np.random.randint(len(vf_pool))]
-    # Resize VF segment to match window if needed
-    if len(vf_seg) < len(x_norm):
-        vf_seg = np.pad(vf_seg, (0, len(x_norm) - len(vf_seg)), 'edge')
-    else:
-        vf_seg = vf_seg[:len(x_norm)]
-    # Blend: 0.3-0.7 alpha mix
-    alpha = np.random.uniform(0.3, 0.7)
-    x_mix = alpha * x_norm + (1 - alpha) * (vf_seg - np.mean(vf_seg)) / (np.std(vf_seg) + 1e-8)
-    return (x_mix - np.mean(x_mix)) / (np.std(x_mix) + 1e-8)
-
-
 def augment_window(x_norm):
     aug_type = np.random.choice(["wander", "noise", "gain", "none"])
     x_aug = x_norm.copy()
@@ -82,60 +82,21 @@ def augment_window(x_norm):
     return (x_aug - np.mean(x_aug)) / (np.std(x_aug) + 1e-8)
 
 
-# ---------- core pipeline ----------
+# =========================================================
+# 信号预处理
+# =========================================================
+
 def clean_ecg_signal(data, fs=360):
     nyq = 0.5 * fs
     b, a = butter(4, [0.5 / nyq, 45.0 / nyq], btype='band')
     return filtfilt(b, a, data)
 
 
-# ---------- waveform stability hazard ----------
-def _cosine_sim(a, b):
-    dot = np.dot(a, b)
-    norm = np.linalg.norm(a) * np.linalg.norm(b)
-    return dot / max(norm, 1e-8)
+# =========================================================
+# RR 特征提取
+# =========================================================
 
-
-def extract_waveform_features(seg):
-    """Extract 6 waveform features for stability comparison."""
-    if len(seg) < 100:
-        return np.zeros(6, dtype=np.float32)
-    seg = np.asarray(seg, dtype=np.float32)
-    amp_std = np.std(seg)
-    deriv_mean = np.mean(np.abs(np.diff(seg)))
-    zcr = np.mean(np.diff(np.signbit(seg)).astype(np.float32))
-    freqs = np.abs(np.fft.rfft(seg))
-    n = len(freqs)
-    lf_band = np.mean(freqs[:max(1, int(n * 0.02))])
-    mf_band = np.mean(freqs[max(1, int(n * 0.02)):max(2, int(n * 0.06))])
-    hf_band = np.mean(freqs[max(2, int(n * 0.06)):max(3, int(n * 0.18))])
-    return np.array([amp_std, deriv_mean, zcr, lf_band, mf_band, hf_band], dtype=np.float32)
-
-
-def compute_waveform_deviation(ecg, win_end):
-    """Waveform deviation from baseline at 3 time scales → [dev_30s, dev_1m, dev_5m] in [0,1]."""
-    win_start = max(0, win_end - PTS_PER_WIN)
-    current_feat = extract_waveform_features(ecg[win_start:win_end])
-
-    bl_short_start = max(0, win_end - 2 * 60 * TARGET_FS)
-    bl_short_end = max(0, win_end - PTS_PER_WIN)
-    bl_short = ecg[bl_short_start:bl_short_end]
-
-    bl_med_start = max(0, win_end - 5 * 60 * TARGET_FS)
-    bl_med = ecg[bl_med_start:bl_short_start]
-
-    dev_short = float(np.clip(1.0 - _cosine_sim(current_feat, extract_waveform_features(bl_short)), 0, 1)) if len(bl_short) > TARGET_FS else 0.0
-    dev_med   = float(np.clip(1.0 - _cosine_sim(current_feat, extract_waveform_features(bl_med)), 0, 1))   if len(bl_med) > TARGET_FS   else dev_short
-    dev_long  = float(np.clip(max(dev_short, dev_med), 0, 1))
-    return [dev_short, dev_med, dev_long]
-
-
-# ---------- RR feature extraction (per-window 4 + trajectory-level 5 = 9) ----------
 def extract_rr_features(ecg_window, fs=250):
-    """Extract RR interval features from a 30s ECG window.
-    Returns (features_4, rr_intervals_ms) tuple.
-    features_4: [mean_rr, sdnn, rmssd, pNN50] — normalised per-window statistics.
-    rr_intervals_ms: raw RR interval array in ms (empty if insufficient peaks)."""
     try:
         seg = np.asarray(ecg_window, dtype=np.float32)
         threshold = 0.5 * np.std(seg)
@@ -144,8 +105,8 @@ def extract_rr_features(ecg_window, fs=250):
         peaks, _ = find_peaks(seg, height=threshold, distance=int(fs * 0.25))
         if len(peaks) < 3:
             return np.zeros(4, dtype=np.float32), np.array([], dtype=np.float32)
-        rr = np.diff(peaks) / fs * 1000.0  # ms
-        mean_rr = np.mean(rr) / 1000.0      # normalised
+        rr = np.diff(peaks) / fs * 1000.0
+        mean_rr = np.mean(rr) / 1000.0
         sdnn = np.std(rr) / 300.0
         rmssd = np.sqrt(np.mean(np.diff(rr) ** 2)) / 100.0 if len(rr) > 1 else 0.0
         pnn50 = np.mean(np.abs(np.diff(rr)) > 50) if len(rr) > 1 else 0.0
@@ -155,241 +116,200 @@ def extract_rr_features(ecg_window, fs=250):
         return np.zeros(4, dtype=np.float32), np.array([], dtype=np.float32)
 
 
-# ---------- Trajectory-level RR features (AFIB vs SVT/AT discrimination) ----------
 def _sample_entropy(rr, m=2, r_factor=0.2):
-    """Sample entropy of RR interval series.
-    Quantifies irregularity: high for AFIB, low for SVT/AT (regular).
-    Normalised by dividing by 2.0 to keep in [0, ~1.5] range."""
     rr = np.asarray(rr, dtype=np.float64)
     N = len(rr)
-    if N < m + 2:
-        return 0.0
+    if N < m + 2: return 0.0
     r = r_factor * np.std(rr)
-    if r < 1e-10:
-        return 0.0
+    if r < 1e-10: return 0.0
 
-    def _phi(template_len):
-        count = 0
-        templates = np.array([rr[i:i + template_len] for i in range(N - template_len)])
-        n_templates = len(templates)
-        if n_templates < 2:
-            return 0
-        for i in range(n_templates):
-            dist = np.max(np.abs(templates - templates[i]), axis=1)
-            count += np.sum(dist < r) - 1
+    def _phi(tl):
+        templates = np.array([rr[i:i+tl] for i in range(N-tl)])
+        nt = len(templates)
+        if nt < 2: return 0
+        count = sum(np.sum(np.max(np.abs(templates - templates[i]), axis=1) < r) - 1
+                    for i in range(nt))
         return max(count, 0)
 
-    A = _phi(m + 1)
-    B = _phi(m)
-    if B < 1:
-        return 0.0
-    ratio = A / B
-    if ratio <= 0:
-        return 0.0
-    return float(-np.log(ratio) / 2.0)
+    A, B = _phi(m+1), _phi(m)
+    return float(-np.log(A / B) / 2.0) if B >= 1 and A > 0 else 0.0
 
 
 def _poincare_features(rr):
-    """Poincare plot features.
-    SD1: short-term (beat-to-beat) variability, perpendicular to identity line.
-    SD2: long-term variability, along identity line.
-    ratio: SD1/SD2 — near 1.0 for AFIB (symmetric scatter); << 0.5 for regular rhythms.
-    Returns [sd1, sd2, ratio] normalised."""
     rr = np.asarray(rr, dtype=np.float64)
-    if len(rr) < 2:
-        return np.array([0.0, 0.0, 0.0], dtype=np.float32)
-    rr_n = rr[1:]
-    rr_n1 = rr[:-1]
-    diff = rr_n - rr_n1
+    if len(rr) < 2: return np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    diff = rr[1:] - rr[:-1]
     var_diff = np.var(diff)
     var_rr = np.var(rr)
     sd1 = np.sqrt(0.5 * max(var_diff, 0))
-    sd2 = np.sqrt(max(2 * var_rr - 0.5 * var_diff, 0))
-    ratio = sd1 / max(sd2, 1e-10)
-    return np.array([sd1 / 100.0, sd2 / 200.0, ratio], dtype=np.float32)
+    sd2 = np.sqrt(max(2*var_rr - 0.5*var_diff, 0))
+    return np.array([sd1/100.0, sd2/200.0, sd1/max(sd2,1e-10)], dtype=np.float32)
 
 
-def compute_trajectory_rr_features(all_rr_intervals):
-    """Compute 5 trajectory-level RR features from concatenated RR intervals in ms.
-    Returns: [sample_entropy, poincare_sd1, poincare_sd2, poincare_ratio, cv_rr]
-    Returns zeros if fewer than 10 total RR intervals."""
-    if len(all_rr_intervals) < 10:
-        return np.zeros(5, dtype=np.float32)
-    rr = np.asarray(all_rr_intervals, dtype=np.float64)
-    sampen = _sample_entropy(rr)
+def compute_traj_rr_features(all_rr):
+    if len(all_rr) < 10: return np.zeros(5, dtype=np.float32)
+    rr = np.asarray(all_rr, dtype=np.float64)
+    s_en = _sample_entropy(rr)
     sd1, sd2, sd_ratio = _poincare_features(rr)
-    cv_rr = float(np.std(rr) / max(np.mean(rr), 1e-8))
-    return np.array([sampen, sd1, sd2, sd_ratio, cv_rr], dtype=np.float32)
+    cv_rr = float(np.std(rr)/max(np.mean(rr), 1e-8))
+    return np.array([s_en, sd1, sd2, sd_ratio, cv_rr], dtype=np.float32)
 
 
-def parse_ucso_annotations(annotation, target_fs, total_pts):
-    rhythm_timeline = np.zeros(total_pts, dtype=int)
-    crit_timeline = np.zeros(total_pts, dtype=int)
+# =========================================================
+# 标注解析
+# =========================================================
+
+def parse_annotations(annotation, target_fs, total_pts):
+    """解析 MIT-BIH 标注为 6 分类时间线。"""
+    labels = np.zeros(total_pts, dtype=int)
 
     current_rhythm = 0
-    current_crit = 0
     last_idx = 0
 
+    # 标注优先级: VF/VFL > VT > AFIB > AFL/AT/SVT > PVC > Normal
     for idx, sym, aux in zip(annotation.sample, annotation.symbol, annotation.aux_note):
         sample_idx = int(idx * (target_fs / 360.0))
         if sample_idx >= total_pts:
             break
 
         if isinstance(aux, str) and aux.startswith('('):
-            # 仅在非 Normal 节律时填充间隙，保留搏动级 PVC 标记 (class 1)
+            # 填充前一段间隙
             if current_rhythm != 0:
-                rhythm_timeline[last_idx:sample_idx] = current_rhythm
-            if current_crit != 0:
-                crit_timeline[last_idx:sample_idx] = current_crit
+                labels[last_idx:sample_idx] = current_rhythm
+
             note = aux.upper()
 
-            if 'AFIB' in note:
-                current_rhythm = 2
-            elif 'SVTA' in note or 'AT' in note or 'AFL' in note:
+            if 'VFIB' in note or 'VFL' in note:
                 current_rhythm = 3
+            elif 'VT' in note:
+                current_rhythm = 4
+            elif 'AFIB' in note:
+                current_rhythm = 2
+            elif 'AFL' in note or 'SVT' in note or 'AT' in note:
+                current_rhythm = 5
             else:
                 current_rhythm = 0
 
-            if 'VFIB' in note or 'VFL' in note:
-                current_crit = 3
-            elif 'VT' in note:
-                current_crit = 2
-            else:
-                current_crit = 0
-
             last_idx = sample_idx
 
+        # 心搏级 PVC
         if sym in ['V', 'E']:
-            # PVC 标注窗口：±1125 samples (4.5s @ 250Hz)，覆盖完整 30s 窗口
-            region = rhythm_timeline[max(0, sample_idx - 1125):min(total_pts, sample_idx + 1125)]
+            region = labels[max(0, sample_idx-1125):min(total_pts, sample_idx+1125)]
             region[region == 0] = 1
 
-        # 心房起源搏动: A(房早), a(差传房早), S(室上早), J(交界早)
-        # 标记为 rhythm class 1，指示心房激惹信号
+        # 心房起源搏动
         if sym in ['A', 'a', 'S', 'J']:
-            region = rhythm_timeline[max(0, sample_idx - 1125):min(total_pts, sample_idx + 1125)]
+            region = labels[max(0, sample_idx-1125):min(total_pts, sample_idx+1125)]
             region[region == 0] = 1
 
+    # 收尾
     if current_rhythm != 0:
-        rhythm_timeline[last_idx:] = current_rhythm
-    if current_crit != 0:
-        crit_timeline[last_idx:] = current_crit
-    return rhythm_timeline, crit_timeline
+        labels[last_idx:] = current_rhythm
+
+    return labels
 
 
-def extract_hierarchical_labels(rhythm_timeline, crit_timeline, win_end, db_source, ecg=None, current_pt=None):
-    current_rhythm = rhythm_timeline[win_end - 1]
-    current_crit = crit_timeline[win_end - 1]
+def get_future_label(labels, pred_start, pred_end):
+    """从未来 5 分钟窗口提取最高危标签。
 
-    if current_crit == 0:
-        win_start = max(0, win_end - TARGET_FS * 30)
-        pvc_ratio = np.mean(rhythm_timeline[win_start:win_end] == 1)
-        if pvc_ratio > 0.15:
-            current_crit = 1
+    优先级: VF(3) > VT(4) > AFIB(2) > AT/AFL/SVT(5) > PVC(1) > Normal(0)
+    直接用最大值即可(类编号越大越危重，AT/SVT=5 在 VT=4 之后是对的)。
+    但 AFIB=2 优先级应高于 AT/SVT=5 — 实际上 AFIB 节律更不稳定。
 
-    # ---- V14: waveform stability hazard (replaces VT/VF event prediction) ----
-    if ecg is not None:
-        hazard_labels = compute_waveform_deviation(ecg, win_end)
-    else:
-        hazard_labels = [0.0, 0.0, 0.0]
+    修正: 使用自定义优先级映射
+    """
+    window = labels[pred_start:pred_end]
+    if len(window) == 0:
+        return 0
 
-    # Database masks — all databases contribute to hazard with continuous labels
-    mask_rhythm, mask_crit, mask_hazard = 1.0, 1.0, 1.0
-    db = db_source.lower()
-    if 'mitdb' in db:
-        mask_rhythm, mask_crit, mask_hazard = 1.0, 1.0, 1.0
-    elif 'afdb' in db:
-        mask_rhythm, mask_crit, mask_hazard = 1.0, 0.0, 1.0  # vfdb/cudb only for crit
-    elif 'vfdb' in db or 'cudb' in db:
-        mask_rhythm, mask_crit, mask_hazard = 0.0, 1.0, 1.0
-    elif 'svdb' in db:
-        mask_rhythm, mask_crit, mask_hazard = 1.0, 1.0, 1.0
-    elif 'ptbxl' in db:
-        mask_rhythm, mask_crit, mask_hazard = 1.0, 0.0, 0.0
+    # 6-class priority: VF(3) > VT(4) > AFIB(2) > AT/SVT(5) > PVC(1) > Normal(0)
+    # 重排: class → priority weight
+    priority = {3: 6, 4: 5, 2: 4, 5: 3, 1: 2, 0: 1}
+    best_cls, best_pri = 0, 0
+    for cls in range(6):
+        count = np.sum(window == cls)
+        if count > 0 and priority[cls] > best_pri:
+            best_pri = priority[cls]
+            best_cls = cls
+    return best_cls
 
-    # 合并 SVT/AT → AFIB (室上性心律失常)
-    if current_rhythm == 3:
-        current_rhythm = 2
 
-    return current_rhythm, current_crit, hazard_labels, mask_rhythm, mask_crit, mask_hazard
-
+# =========================================================
+# 数据集构建
+# =========================================================
 
 def init_buffer():
-    return {
-        'X': [], 'X_rr': [], 'Y_rhythm': [], 'Y_criticality': [], 'Y_hazard': [],
-        'M_rhythm': [], 'M_criticality': [], 'M_hazard': [],
-    }
+    return {'X': [], 'X_rr': [], 'Y': []}
 
 
-def save_shard(buffer, shard_idx, save_dir, split_name):
-    shard_path = os.path.join(save_dir, f'{split_name}_shard_{shard_idx:03d}.pt')
+def save_shard(buffer, shard_idx, split_name):
+    path = os.path.join(SAVE_DIR, f'{split_name}_shard_{shard_idx:03d}.pt')
     torch.save({
         'X': torch.tensor(np.array(buffer['X']), dtype=torch.float16),
         'X_rr': torch.tensor(np.array(buffer['X_rr']), dtype=torch.float16),
-        'Y_rhythm': torch.tensor(buffer['Y_rhythm'], dtype=torch.long),
-        'Y_criticality': torch.tensor(buffer['Y_criticality'], dtype=torch.long),
-        'Y_hazard': torch.tensor(buffer['Y_hazard'], dtype=torch.float32),
-        'M_rhythm': torch.tensor(buffer['M_rhythm'], dtype=torch.float32),
-        'M_criticality': torch.tensor(buffer['M_criticality'], dtype=torch.float32),
-        'M_hazard': torch.tensor(buffer['M_hazard'], dtype=torch.float32)
-    }, shard_path)
-    print(f'[streaming] shard {os.path.basename(shard_path)}  ({len(buffer["X"])} samples)')
+        'Y': torch.tensor(buffer['Y'], dtype=torch.long),
+    }, path)
+    print(f'  [shard] {os.path.basename(path)}  ({len(buffer["X"])} samples)')
 
 
-def build_v10_dataset(record_list, name, db_source):
+def build_dataset(record_list, name, db_source):
     buffer = init_buffer()
-    shard_idx = 0
-    total_extracted = 0
+    shard_idx, total_extracted = 0, 0
+    import time as _time
 
-    for rec in tqdm(record_list, desc=f"Building [{name}]"):
+    for rec_idx, rec in enumerate(tqdm(record_list, desc=f"Building [{name}]")):
         try:
+            _t0 = _time.time()
+
+            # 检查本地标注文件是否存在，避免触发 PhysioNet 下载
+            atr_path = rec + '.atr'
+            if not os.path.exists(atr_path):
+                print(f"  [skip] {rec}: no local .atr file, skipping")
+                continue
+
             record = wfdb.rdrecord(rec)
-            annotation = wfdb.rdann(rec, 'atr')
+            # 不指定 pn_dir 以避免 wfdb 自动联网下载
+            annotation = wfdb.rdann(rec, 'atr', pn_dir=None)
+
+            # AFDB 长程记录 (10h+) 截断至前 2 小时以加速处理
+            signal_len = record.sig_len if hasattr(record, 'sig_len') else len(record.p_signal)
+            MAX_SAMPLES = 2 * 3600 * 360  # 2 hours @ 360Hz
+            orig_len = signal_len
+            if signal_len > MAX_SAMPLES:
+                signal_len = MAX_SAMPLES
+                print(f"  [info] {rec}: truncating {orig_len/360/3600:.1f}h → 2h")
+
+            raw_sig = record.p_signal[:signal_len, 0]
             ecg = signal.resample_poly(
-                clean_ecg_signal(record.p_signal[:, 0], fs=360), TARGET_FS, 360
-            )
+                clean_ecg_signal(raw_sig, fs=360),
+                TARGET_FS, 360)
+            ecg = ecg.astype(np.float32)
 
-            rhy_timeline, cri_timeline = parse_ucso_annotations(
-                annotation, TARGET_FS, len(ecg)
-            )
+            labels = parse_annotations(annotation, TARGET_FS, len(ecg))
 
-            # SVT/AT 节律窗口扩展: aux_note 仅标记节律起始点，扩展至后续 60s
-            is_svt = rhy_timeline == 3
-            if is_svt.any():
-                svt_ends = np.where(is_svt[:-1] & ~is_svt[1:])[0]
+            # 扩展 SVT/AT 节律窗口: aux_note 仅标记起始点，延长至 60s
+            svt_mask = labels == 5
+            if svt_mask.any():
+                svt_ends = np.where(svt_mask[:-1] & ~svt_mask[1:])[0]
                 for end_pos in svt_ends:
-                    end_s = min(len(rhy_timeline), end_pos + 15000)  # 60s @ 250Hz
-                    region = rhy_timeline[end_pos:end_s]
-                    region[region == 0] = 2  # 合并到 AFIB (室上性心律失常)
-
-            # ---- Collect VF waveform segments for CutMix augmentation ----
-            vf_pool = []
-            vf_mask = cri_timeline >= 3
-            if vf_mask.any():
-                # Extract contiguous VF regions
-                vf_starts = np.where(vf_mask[1:] & ~vf_mask[:-1])[0]
-                vf_ends = np.where(~vf_mask[1:] & vf_mask[:-1])[0]
-                for s, e in zip(vf_starts[:20], vf_ends[:20]):  # max 20 segments
-                    if e - s > TARGET_FS:  # at least 1 second
-                        vf_pool.append(ecg[s:e].copy())
-
+                    end_s = min(len(labels), end_pos + 15000)
+                    region = labels[end_pos:end_s]
+                    region[region == 0] = 5
 
             current_pt = 0
-            max_pt = len(ecg) - HISTORY_SEC * TARGET_FS
+            max_pt = len(ecg) - (HISTORY_SEC + PREDICT_SEC) * TARGET_FS
+            if max_pt <= 0:
+                continue
 
             while current_pt < max_pt:
-                win_end = current_pt + HISTORY_SEC * TARGET_FS
+                history_end = current_pt + HISTORY_SEC * TARGET_FS
+                pred_start = history_end
+                pred_end = pred_start + PREDICT_SEC * TARGET_FS
 
-                r_lbl, c_lbl, h_lbl, m_r, m_c, m_h = extract_hierarchical_labels(
-                    rhy_timeline, cri_timeline, win_end, db_source,
-                    ecg=ecg, current_pt=current_pt,
-                )
+                # 从未来 5 分钟提取标签
+                label = get_future_label(labels, pred_start, pred_end)
 
-                # ---- split oversampling (rhy vs cri, 独立控制) ----
-                n_repeats = max(
-                    MAX_REPEATS_RHY.get(r_lbl, 1),
-                    MAX_REPEATS_CRI.get(c_lbl, 1),
-                )
+                n_repeats = MAX_REPEATS.get(label, 1)
 
                 for aug_i in range(n_repeats):
                     seq_x = []
@@ -404,11 +324,7 @@ def build_v10_dataset(record_list, name, db_source):
                         x_norm = (x_raw - np.mean(x_raw)) / (np.std(x_raw) + 1e-8)
 
                         if aug_i > 0:
-                            # Apply VF CutMix with 40% probability for VF-class samples
-                            if c_lbl >= 3 and vf_pool and np.random.random() < 0.10:
-                                x_norm = cutmix_vf(x_norm, vf_pool)
-                            else:
-                                x_norm = augment_window(x_norm)
+                            x_norm = augment_window(x_norm)
 
                         seq_x.append(x_norm.astype(np.float16))
 
@@ -418,70 +334,117 @@ def build_v10_dataset(record_list, name, db_source):
                             if len(intervals) > 0:
                                 all_rr_intervals.append(intervals)
 
-                    # ---- Trajectory-level RR features (5-dim, broadcast to all 19 windows) ----
                     if aug_i == 0:
                         if len(all_rr_intervals) > 0:
                             concat_rr = np.concatenate(all_rr_intervals)
-                            traj_feat = compute_trajectory_rr_features(concat_rr).astype(np.float16)
+                            traj_feat = compute_traj_rr_features(concat_rr).astype(np.float16)
                         else:
                             traj_feat = np.zeros(5, dtype=np.float16)
                         seq_rr_full = np.array([
                             np.concatenate([seq_rr_4[w_i], traj_feat])
                             for w_i in range(N_WINDOWS)
-                        ], dtype=np.float16)  # shape: [19, 9]
+                        ], dtype=np.float16)
 
                     buffer['X'].append(
-                        np.array(seq_x).reshape(N_WINDOWS, 1, PTS_PER_WIN)
-                    )
+                        np.array(seq_x).reshape(N_WINDOWS, 1, PTS_PER_WIN))
                     buffer['X_rr'].append(seq_rr_full.copy())
-
-                    buffer['Y_rhythm'].append(r_lbl)
-                    buffer['Y_criticality'].append(c_lbl)
-                    buffer['Y_hazard'].append(h_lbl)
-                    buffer['M_rhythm'].append(m_r)
-                    buffer['M_criticality'].append(m_c)
-                    buffer['M_hazard'].append(m_h)
-
+                    buffer['Y'].append(label)
                     total_extracted += 1
 
-                # ---- shard checkpoint ----
                 if len(buffer['X']) >= SHARD_SIZE:
-                    save_shard(buffer, shard_idx, SAVE_DIR, name)
+                    save_shard(buffer, shard_idx, name)
                     shard_idx += 1
                     buffer = init_buffer()
 
-                # ---- fixed stride with per-db override (afdb downsampled 5x) ----
                 stride = DB_STRIDE_OVERRIDE.get(db_source, FIXED_STRIDE_SEC)
                 current_pt += int(stride * TARGET_FS)
 
+            _elapsed = _time.time() - _t0
+            if _elapsed > 30:
+                print(f"  [slow] {rec}: {_elapsed:.1f}s, {orig_len} samples → {total_extracted} trajectories")
+
         except Exception as e:
-            print(f"[skip] {rec}: {type(e).__name__}: {e}")
+            print(f"  [skip] {rec}: {type(e).__name__}: {e}")
+            import traceback
+            traceback.print_exc()
             continue
 
     if len(buffer['X']) > 0:
-        save_shard(buffer, shard_idx, SAVE_DIR, name)
+        save_shard(buffer, shard_idx, name)
 
-    print(f"[done] {name}: {total_extracted} trajectories")
+    print(f"  [done] {name}: {total_extracted} trajectories")
+    return total_extracted
 
+
+# =========================================================
+# 主流程
+# =========================================================
 
 if __name__ == '__main__':
-    print("心电智能监护数据管道 — 三分类节律 + 波形稳定性偏离指数 + RR 轨迹特征")
-    target_databases = ['mitdb', 'afdb', 'vfdb', 'cudb', 'svdb']
+    print("=" * 60)
+    print("超前 5 分钟心律失常预测 — 数据集构建")
+    print(f"输入: {HISTORY_SEC}s (过去 10 分钟) → 输出: {PREDICT_SEC}s (未来 5 分钟)")
+    print(f"窗口划分: {N_WINDOWS} 窗口 × {WINDOW_SEC}s (步长 {OVERLAP_STRIDE_SEC}s)")
+    print("=" * 60)
 
-    for db_name in target_databases:
+    # ---- 收集 MIT-BIH 记录 ----
+    mitdb_dir = os.path.join(DATA_DIR, 'mitdb')
+    all_mitdb = sorted([
+        f.split('.')[0] for f in os.listdir(mitdb_dir)
+        if f.endswith('.dat')
+    ]) if os.path.isdir(mitdb_dir) else []
+
+    demo_mitdb = DEMO_CASES['mitdb']
+    train_mitdb = [r for r in all_mitdb if r not in demo_mitdb and r not in VAL_MITDB]
+    val_mitdb = [r for r in all_mitdb if r in VAL_MITDB]
+
+    print(f"\nMIT-BIH: {len(all_mitdb)} records total")
+    print(f"  Train: {len(train_mitdb)}  |  Val: {len(val_mitdb)}  |  Demo: {len(demo_mitdb)}")
+
+    # ---- 收集补充数据库记录 ----
+    train_supplements = {}
+    val_supplements = {}
+    for db_name, recs in SUPPLEMENT_RECORDS.items():
         db_dir = os.path.join(DATA_DIR, db_name)
-        if os.path.exists(db_dir):
-            print(f"\nDatabase: [{db_name}]")
-            recs = [
-                os.path.join(db_dir, f.split('.')[0])
-                for f in os.listdir(db_dir) if f.endswith('.dat')
-            ]
-            if not recs:
-                continue
+        if not os.path.isdir(db_dir):
+            print(f"  [{db_name}] 目录不存在，跳过")
+            continue
+        available = [f.split('.')[0] for f in os.listdir(db_dir) if f.endswith('.dat')]
+        found = [r for r in recs if r in available]
+        if len(found) > 1:
+            train_supplements[db_name] = found[:-1]
+            val_supplements[db_name] = [found[-1]]
+        else:
+            train_supplements[db_name] = found
+        print(f"  [{db_name}]: {len(found)}/{len(recs)} available")
 
-            random.seed(42)
-            random.shuffle(recs)
-            split = int(0.8 * len(recs))
+    # ---- 构建训练集 ----
+    print("\n" + "=" * 60)
+    print("📦 构建训练集 (MIT-BIH 纯库)")
+    print("=" * 60)
 
-            build_v10_dataset(recs[:split], f'v15_{db_name}_train', db_source=db_name)
-            build_v10_dataset(recs[split:], f'v15_{db_name}_val', db_source=db_name)
+    train_recs = [os.path.join(mitdb_dir, r) for r in train_mitdb]
+    # 补充库暂不加入，先用纯 MIT-BIH 快速验证
+    # for db_name, recs in train_supplements.items():
+    #     db_dir = os.path.join(DATA_DIR, db_name)
+    #     train_recs.extend([os.path.join(db_dir, r) for r in recs])
+
+    random.seed(42)
+    random.shuffle(train_recs)
+    build_dataset(train_recs, 'train', db_source='mitdb')
+
+    # ---- 构建验证集 ----
+    print("\n" + "=" * 60)
+    print("📦 构建验证集 (MIT-BIH 纯库)")
+    print("=" * 60)
+
+    val_recs = [os.path.join(mitdb_dir, r) for r in val_mitdb]
+    # for db_name, recs in val_supplements.items():
+    #     db_dir = os.path.join(DATA_DIR, db_name)
+    #     val_recs.extend([os.path.join(db_dir, r) for r in recs])
+
+    build_dataset(val_recs, 'val', db_source='mitdb')
+
+    print("\n✅ 数据集构建完成。")
+    print(f"  - 演示集 (绝不参与训练): {DEMO_CASES}")
+    print(f"  - 训练验证 gap 记录: {VAL_MITDB}")

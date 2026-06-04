@@ -1,14 +1,74 @@
 """
 Script: dl_model.py
-Version: Causal TCN + Energy Envelope + 3-class Rhythm
+心电监护预警网络 — 超前 5 分钟心律失常预测
+
+架构融合：
+  1. WindowEncoder — 4 阶段 CNN 骨干预训练 (PTB-XL)，单窗口形态学编码
+  2. Global Skip TCN — 3 层因果时序卷积 + 多尺度跳跃连接汇总
+  3. RR 间期特征分支 — 样本熵 + 庞加莱图，区分房颤与规则性室上速
+  4. 能量包络分支 — 模拟希尔伯特包络检波，节律模式感知
+  5. Sigmoid 时序注意力 — 产生 1D-CAM 可解释热力图
+  6. 单一 6 分类输出 — 未来 5 分钟心律失常预测
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
+# ==========================================
+# 基础组件
+# ==========================================
+
+class Chomp1d(nn.Module):
+    """因果裁剪：移除右侧填充，确保时序不泄露未来信息"""
+    def __init__(self, chomp_size):
+        super().__init__()
+        self.chomp_size = chomp_size
+
+    def forward(self, x):
+        return x[:, :, :-self.chomp_size].contiguous()
+
+
+class TemporalBlock(nn.Module):
+    """因果时序卷积块 — 同时返回主路径和跳跃连接输出"""
+
+    def __init__(self, n_inputs, n_outputs, kernel_size, stride, dilation, dropout=0.2):
+        super().__init__()
+        padding = (kernel_size - 1) * dilation
+        self.conv1 = nn.Conv1d(
+            n_inputs, n_outputs, kernel_size,
+            stride=stride, padding=padding, dilation=dilation)
+        self.chomp1 = Chomp1d(padding)
+        self.relu1 = nn.ReLU()
+        self.dropout1 = nn.Dropout(dropout)
+
+        self.conv2 = nn.Conv1d(
+            n_outputs, n_outputs, kernel_size,
+            stride=stride, padding=padding, dilation=dilation)
+        self.chomp2 = Chomp1d(padding)
+        self.relu2 = nn.ReLU()
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.net = nn.Sequential(
+            self.conv1, self.chomp1, self.relu1, self.dropout1,
+            self.conv2, self.chomp2, self.relu2, self.dropout2)
+        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) if n_inputs != n_outputs else None
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        out = self.net(x)
+        res = x if self.downsample is None else self.downsample(x)
+        main_out = self.relu(out + res)
+        skip_out = out  # 纯净特征，未经残差叠加
+        return main_out, skip_out
+
+
+# ==========================================
+# 窗口编码器 (PTB-XL 预训练骨干)
+# ==========================================
+
 class WindowEncoder(nn.Module):
-    """单窗口形态学编码器 — 直连单通道 ECG，无伪多导联投影。"""
+    """单窗口形态学编码器 — 4 阶段 CNN，输出 256 维嵌入"""
 
     def __init__(self, in_channels=1, embed_dim=256):
         super().__init__()
@@ -41,144 +101,142 @@ class WindowEncoder(nn.Module):
         return self.pool_proj(torch.cat([avg, max_f], dim=-1))
 
 
-class HierarchicalHazardHeads(nn.Module):
-    """三层预警头 — 节律 (3cls) / 危急度 (4cls) / 波形稳定性偏离指数 (3 scale)。"""
+# ==========================================
+# 核心预警网络
+# ==========================================
 
-    def __init__(self, hidden_dim=256):
-        super().__init__()
-        self.rhythm_head = nn.Linear(hidden_dim, 3)  # Normal, PVC, 室上性心律失常
-        self.criticality_head = nn.Linear(hidden_dim, 4)
-        self.hazard_deltas = nn.Linear(hidden_dim, 3)
-        self.hazard_temperature = nn.Parameter(torch.ones(1))
-
-    def forward_instant(self, h):
-        """即时分类 — 当前时刻的节律和危急度。h: [B, hidden_dim]"""
-        return (
-            self.rhythm_head(h).unsqueeze(1),
-            self.criticality_head(h).unsqueeze(1),
-        )
-
-    def forward_hazard(self, h):
-        """波形稳定性偏离指数 — 三个独立时间尺度，非级联。h: [B, hidden_dim]"""
-        raw = self.hazard_deltas(h)
-        t = self.hazard_temperature.clamp(min=0.5, max=5.0)
-        p30s = torch.sigmoid(raw[..., 0] / t)
-        p1m  = torch.sigmoid(raw[..., 1] / t)
-        p5m  = torch.sigmoid(raw[..., 2] / t)
-        return torch.stack([p30s, p1m, p5m], dim=-1).unsqueeze(1)
-
-
-class HybridWarningNet(nn.Module):
-    """旧版多分类预警模型（遗留兼容）。"""
-
-    def __init__(self, in_channels=1, embed_dim=256, num_classes=6):
-        super().__init__()
-        self.encoder = WindowEncoder(in_channels, embed_dim)
-        self.classifier = nn.Sequential(
-            nn.Dropout(0.3),
-            nn.Linear(embed_dim, 128), nn.ReLU(),
-            nn.Linear(128, num_classes),
-        )
-
-    def forward(self, x):
-        return {"logits": self.classifier(self.encoder(x))}
-
-
-class HierarchicalHazardNet(nn.Module):
+class ArrhythmiaWarningNet(nn.Module):
     """
-    因果 TCN + 能量包络 + RR 分支 (三分类节律)。
-    SVT/AT 合并至室上性心律失常。因果卷积+能量包络+双池化+注意力机制。
+    超前 5 分钟心律失常预测网络。
+
+    输入: ECG 轨迹 [B, N_WINDOWS, 1, PTS_PER_WIN]
+          RR 特征 [B, N_WINDOWS, 9]（可选）
+    输出: 6 分类 logits + 1D-CAM 热力图
     """
 
-    def __init__(self, in_channels=1, embed_dim=256, hidden_dim=256, rr_dim=9, rr_hidden=64):
+    def __init__(self,
+                 in_channels=1,
+                 embed_dim=256,
+                 hidden_dim=256,
+                 n_windows=39,
+                 rr_dim=9,
+                 rr_hidden=64,
+                 num_classes=6,
+                 tcn_channels=(256, 256, 256),
+                 dropout=0.2):
         super().__init__()
+
+        # ---- 1. 窗口编码器 (PTB-XL 预训练) ----
         self.window_encoder = WindowEncoder(in_channels, embed_dim)
 
-        # Causal temporal conv: 左填充 only, 不泄露未来信息
-        self.tconv1 = nn.Conv1d(embed_dim, embed_dim, kernel_size=3, padding=0)
-        self.tbn1 = nn.BatchNorm1d(embed_dim)
-        self.tconv2 = nn.Conv1d(embed_dim, hidden_dim, kernel_size=3, padding=0, dilation=2)
-        self.tbn2 = nn.BatchNorm1d(hidden_dim)
+        # ---- 2. Global Skip TCN ----
+        tcn_layers = []
+        skip_adapters = []
+        in_ch = embed_dim
+        for i, out_ch in enumerate(tcn_channels):
+            dilation = 2 ** i
+            tcn_layers.append(
+                TemporalBlock(in_ch, out_ch, kernel_size=3, stride=1,
+                              dilation=dilation, dropout=dropout))
+            if i < len(tcn_channels) - 1:
+                skip_adapters.append(nn.Conv1d(out_ch, hidden_dim, 1))
+            in_ch = out_ch
+        self.tcn_blocks = nn.ModuleList(tcn_layers)
+        self.skip_adapters = nn.ModuleList(skip_adapters)
 
-        # 双注意力：危急度与预警各自独立查询
-        self.crit_attention_query = nn.Linear(hidden_dim, 1, bias=False)
-        self.haz_attention_query = nn.Linear(hidden_dim, 1, bias=False)
+        # ---- 3. 时序注意力 (1D-CAM) ----
+        self.temporal_attn = nn.Sequential(
+            nn.Conv1d(hidden_dim, 32, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv1d(32, 1, kernel_size=1),
+            nn.Sigmoid(),
+        )
 
-        self.dropout = nn.Dropout(0.25)  # 平衡 VT 连续性 vs SVT/AT 过拟合
-
-        # RR 特征编码器: rr_dim(9) → rr_hidden(64) → hidden_dim(256)
+        # ---- 4. RR 间期特征编码 ----
         self.rr_encoder = nn.Sequential(
             nn.Linear(rr_dim, rr_hidden), nn.ReLU(),
             nn.Linear(rr_hidden, hidden_dim),
         )
 
-        # 能量包络节律分支 — 模拟希尔伯特包络检波, 不依赖 R 峰检测
-        # AvgPool1d(k=25,s=25) 将 7500 样本压为 300 个能量脉冲
+        # ---- 5. 能量包络分支 ----
         self.env_pool = nn.AvgPool1d(kernel_size=25, stride=25)
         self.env_encoder = nn.Sequential(
             nn.Linear(300, 64), nn.ReLU(),
             nn.Linear(64, hidden_dim),
         )
 
-        self.heads = HierarchicalHazardHeads(hidden_dim)
+        # ---- 6. 分类头 (6 类) ----
+        self.class_head = nn.Sequential(
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, 128), nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(128, num_classes),
+        )
 
     def forward(self, x_seq, x_rr=None):
+        """
+        Args:
+            x_seq: [B, S, C, L]   S=窗口数, C=1, L=窗口采样点
+            x_rr:  [B, S, 9]      可选 RR 特征
+        Returns:
+            dict with logits, prob, cam
+        """
         B, S, C, L = x_seq.shape
         flat = x_seq.reshape(B * S, C, L)
 
-        # 分块窗口编码
+        # ---- 步骤 1: 窗口编码 ----
         CHUNK = 64
         z_chunks = []
         for i in range(0, B * S, CHUNK):
             z_chunks.append(self.window_encoder(flat[i : i + CHUNK]))
-            torch.cuda.empty_cache()
-        z_all = torch.cat(z_chunks, dim=0)             # [B*S, embed_dim]
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        z_all = torch.cat(z_chunks, dim=0)  # [B*S, embed_dim]
 
-        # [B*S, embed_dim] → [B, embed_dim, S] → temporal conv
-        z_seq = z_all.view(B, S, -1).transpose(1, 2)   # [B, embed_dim, S]
-        h_seq = F.pad(z_seq, (2, 0))                      # k=3,d=1 → left pad 2
-        h_seq = F.relu(self.tbn1(self.tconv1(h_seq)))
-        h_seq = F.pad(h_seq, (4, 0))                      # k=3,d=2 → left pad 4
-        h_seq = F.relu(self.tbn2(self.tconv2(h_seq)))      # [B, hidden_dim, S]
-        h_seq = h_seq.transpose(1, 2)                    # [B, S, hidden_dim]
+        # ---- 步骤 2: Global Skip TCN ----
+        t_in = z_all.view(B, S, -1).transpose(1, 2)  # [B, embed_dim, S]
+        global_skip = 0
+        for i, block in enumerate(self.tcn_blocks):
+            t_in, skip_out = block(t_in)
+            if i < len(self.skip_adapters):
+                global_skip = global_skip + self.skip_adapters[i](skip_out)
+            else:
+                # 最后一层 skip 直接加入，无需适配器（通道已对齐）
+                if skip_out.size(1) == self.skip_adapters[-1].out_channels:
+                    global_skip = global_skip + skip_out
+                else:
+                    # fallback: 使用倒数第二个适配器
+                    global_skip = global_skip + self.skip_adapters[-1](skip_out)
 
-        h_current = h_seq[:, -1, :]                      # [B, hidden_dim]
+        # ---- 步骤 3: 注意力加权池化 ----
+        attn_weights = self.temporal_attn(global_skip)         # [B, 1, S_tcn]
+        weighted_feat = torch.sum(global_skip * attn_weights, dim=2) \
+                        / (attn_weights.sum(dim=2) + 1e-4)    # [B, hidden_dim]
 
-        # ---- RR 特征支路: 注入节律信息以区分 AFib vs SVT/AT ----
+        # ---- 步骤 4: RR 特征注入 ----
         if x_rr is not None:
-            rr_feat = self.rr_encoder(x_rr[:, -1, :])   # [B, hidden_dim]
-            h_current = h_current + rr_feat
+            rr_feat = self.rr_encoder(x_rr[:, -1, :])          # [B, hidden_dim]
+            weighted_feat = weighted_feat + rr_feat
 
-        # ---- 能量包络支路: abs→包络检波→节律模式 ----
-        env = self.env_pool(torch.abs(flat))            # [B*S, 1, 300]
-        env = env.view(B * S, -1)                        # [B*S, 300]
-        env_feat = self.env_encoder(env)                 # [B*S, hidden_dim]
-        env_feat = env_feat.view(B, S, -1)[:, -1, :]    # [B, hidden_dim]
-        h_current = h_current + env_feat
+        # ---- 步骤 5: 能量包络注入 ----
+        env = self.env_pool(torch.abs(flat))                   # [B*S, 1, 300]
+        env = env.view(B * S, -1)
+        env_feat = self.env_encoder(env)                        # [B*S, hidden_dim]
+        env_feat = env_feat.view(B, S, -1).mean(dim=1)         # [B, hidden_dim]
+        weighted_feat = weighted_feat + env_feat
 
-        # 危急度注意力：sigmoid 允许多时间点同时激活（归一化防膨胀）
-        crit_attn = torch.sigmoid(self.crit_attention_query(h_seq))
-        h_crit_ctx = torch.sum(h_seq * crit_attn, dim=1) / (crit_attn.sum(dim=1) + 1e-4)
-        h_crit = h_current + h_crit_ctx
+        # ---- 步骤 6: 分类 ----
+        logits = self.class_head(weighted_feat)                 # [B, 6]
 
-        # 预警注意力：独立查询，聚焦前兆窗口
-        haz_attn = torch.sigmoid(self.haz_attention_query(h_seq))
-        h_hazard = torch.sum(h_seq * haz_attn, dim=1) / (haz_attn.sum(dim=1) + 1e-4)
-
-        # Dropout 防过拟合
-        h_current = self.dropout(h_current)
-        h_crit = self.dropout(h_crit)
-        h_hazard = self.dropout(h_hazard)
-
-        rhythm_logits = self.heads.rhythm_head(h_current).unsqueeze(1)
-        criticality_logits = self.heads.criticality_head(h_crit).unsqueeze(1)
-        hazard_probs = self.heads.forward_hazard(h_hazard)
+        # ---- 步骤 7: 1D-CAM 热力图 ----
+        _hd = weighted_feat.size(-1)
+        cam_weights = self.class_head[1].weight[:, :_hd].mean(dim=0)
+        cam_1d = torch.relu(torch.sum(
+            cam_weights.view(1, _hd, 1) * global_skip, dim=1))
+        cam_1d = cam_1d / (cam_1d.max(dim=1, keepdim=True)[0] + 1e-8)
 
         return {
-            "preds": {
-                "rhythm_logits": rhythm_logits,
-                "criticality_logits": criticality_logits,
-                "hazard_probs": hazard_probs,
-            },
-            "h_seq": h_current,
+            "logits": logits,
+            "prob": torch.softmax(logits, dim=1),
+            "cam": cam_1d,
         }

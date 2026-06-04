@@ -1,5 +1,9 @@
 ﻿"""
-模块名称：智能预警训练引擎 (Training Engine - 多分类加权版)
+[DEPRECATED] train_massive_v5.py — 旧版 V5 六分类训练脚本
+已被 train_trajectory.py 取代。此文件保留仅作参考。
+
+旧版数据集格式 (train_massive_v5.pt) 与新超前预测数据集不兼容。
+请运行 build_dataset_factory.py → train_trajectory.py 完成训练。
 """
 import torch
 from torch.utils.data import TensorDataset, DataLoader

@@ -44,11 +44,18 @@ def test_via_api(ecg_array):
         )
         if resp.status_code == 200:
             result = resp.json()
-            print("🔗 网关回执结果呈现 (分层诊断):")
-            print(f"- 节律分布 (Rhythm):     {np.round(np.array(result['rhythm'])*100, 1)}")
-            print(f"- 危急评估 (Criticality): {np.round(np.array(result['criticality'])*100, 1)}")
-            print(f"- 生存预警 (Hazard):     {np.round(np.array(result['hazard'])*100, 1)}")
-            print(f"- 风险轨迹 (Trajectory): {np.round(np.array(result['risk_trajectory'])*100, 1)}")
+            pred_class = result.get("pred_class", 0)
+            class_name = result.get("class_name", "未知")
+            probs = result.get("probabilities", [])
+            print("🔗 网关回执结果呈现:")
+            print(f"- 预测类别: {pred_class} ({class_name})")
+            if probs:
+                names = ["正常", "PVC", "AFib", "VF", "VT", "AT/SVT"]
+                for i, (n, p) in enumerate(zip(names, probs)):
+                    print(f"  {n}: {p*100:.1f}%")
+            cam = result.get("cam", [])
+            if cam:
+                print(f"- CAM 热力图长度: {len(cam)}")
         else:
             print(f"⚠️ 状态回执响应非预期: {resp.status_code}")
     except requests.exceptions.Timeout:

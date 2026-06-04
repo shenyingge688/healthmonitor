@@ -1,12 +1,11 @@
 """
-validation_multiclass.py — 全量多层级临床验证
+validation_multiclass.py — 超前 5 分钟心律失常预测性能评估
 
-评估内容:
-  1. Rhythm (3-class)          混淆矩阵 + per-class P/R/F1 + OVR AUC
-  2. Criticality (4-class)     混淆矩阵 + VT/VF 召回率 + OVR AUC
-  3. Hazard (3-label)          Per-horizon AUPRC/AUC + 校准曲线 + Brier Score
-  4. Warning Fusion            effective_risk ROC / AUPRC
-  5. 可视化                      保存至 results/
+评估指标:
+  - 6 类混淆矩阵 + per-class P/R/F1
+  - 多分类 Macro/Weighted AUC
+  - 每类 PR 曲线 + AP
+  - 1D-CAM 可视化示例
 """
 import os
 import glob
@@ -23,10 +22,9 @@ from sklearn.metrics import (
     average_precision_score,
     roc_auc_score,
     roc_curve,
-    brier_score_loss,
 )
 
-from dl_model import HierarchicalHazardNet
+from dl_model import ArrhythmiaWarningNet
 
 plt.rcParams["font.sans-serif"] = ["SimHei"]
 plt.rcParams["axes.unicode_minus"] = False
@@ -34,40 +32,35 @@ plt.rcParams["axes.unicode_minus"] = False
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 os.makedirs("results", exist_ok=True)
 
+CLASS_NAMES = [
+    "正常窦性心律", "室性早搏 (PVC)", "心房颤动 (AFib)",
+    "心室颤动 (VF)", "室性心动过速 (VT)", "房速/室上速 (AT/SVT)"
+]
 
-# =========================================================
+
 def load_sharded_datasets(split_prefix="val"):
-    shard_paths = glob.glob(f"dataset/v15_*_{split_prefix}_shard_*.pt")
+    shard_paths = glob.glob(f"dataset/{split_prefix}_shard_*.pt")
     datasets = []
-    names = [__import__('os').path.basename(p) for p in shard_paths]
-    print(f"  found {len(shard_paths)} shards: {names}")
+    names = [os.path.basename(p) for p in shard_paths]
+    print(f"  发现 {len(shard_paths)} 个 shard: {names}")
     for path in shard_paths:
         data = torch.load(path, map_location="cpu", weights_only=True)
-        has_rr = "X_rr" in data
-        if has_rr:
-            datasets.append(TensorDataset(
-                data["X"], data["X_rr"],
-                data["Y_rhythm"], data["Y_criticality"], data["Y_hazard"],
-                data["M_rhythm"], data["M_criticality"], data["M_hazard"],
-            ))
+        if "X_rr" in data:
+            datasets.append(TensorDataset(data["X"], data["X_rr"], data["Y"]))
         else:
-            dummy_rr = torch.zeros(len(data["X"]), 19, 9, dtype=torch.float16)
-            datasets.append(TensorDataset(
-                data["X"], dummy_rr,
-                data["Y_rhythm"], data["Y_criticality"], data["Y_hazard"],
-                data["M_rhythm"], data["M_criticality"], data["M_hazard"],
-            ))
+            dummy_rr = torch.zeros(len(data["X"]), 39, 9, dtype=torch.float16)
+            datasets.append(TensorDataset(data["X"], dummy_rr, data["Y"]))
     return ConcatDataset(datasets)
 
 
-def plot_cm(y_true, y_pred, names, title, path, labels=None):
-    cm = confusion_matrix(y_true, y_pred, labels=labels)
-    fig, ax = plt.subplots(figsize=(7, 6))
+def plot_cm(y_true, y_pred, names, title, path):
+    cm = confusion_matrix(y_true, y_pred)
+    fig, ax = plt.subplots(figsize=(9, 8))
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues",
                 xticklabels=names, yticklabels=names, ax=ax)
     ax.set_title(title)
-    ax.set_ylabel("True")
-    ax.set_xlabel("Predicted")
+    ax.set_ylabel("真实标签")
+    ax.set_xlabel("预测标签")
     fig.tight_layout()
     fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
@@ -79,28 +72,9 @@ def plot_pr(y_true, y_prob, label, path):
     fig, ax = plt.subplots(figsize=(6, 5))
     ax.plot(recall, precision, lw=2, label=f"AP={ap:.4f}")
     ax.fill_between(recall, precision, alpha=0.2)
-    ax.set_xlabel("Recall"); ax.set_ylabel("Precision")
+    ax.set_xlabel("召回率"); ax.set_ylabel("精确率")
     ax.set_title(label); ax.legend(loc="lower left")
     ax.grid(True, linestyle="--", alpha=0.5)
-    fig.tight_layout(); fig.savefig(path, dpi=200, bbox_inches="tight")
-    plt.close(fig)
-    return ap
-
-
-def plot_cal(y_true, y_prob, n_bins=10, title="", path=""):
-    bins = np.linspace(0, 1, n_bins + 1)
-    centers, freqs = [], []
-    for i in range(n_bins):
-        m = (y_prob >= bins[i]) & (y_prob < bins[i + 1])
-        if m.sum() > 0:
-            centers.append(y_prob[m].mean())
-            freqs.append(y_true[m].mean())
-    if not centers: return
-    fig, ax = plt.subplots(figsize=(5, 5))
-    ax.plot(centers, freqs, "o-", lw=2, label="Model")
-    ax.plot([0, 1], [0, 1], "k--", alpha=0.5, label="Perfect")
-    ax.set_xlabel("Predicted"); ax.set_ylabel("True Frequency")
-    ax.set_title(title); ax.legend(); ax.grid(True, linestyle="--", alpha=0.5)
     fig.tight_layout(); fig.savefig(path, dpi=200, bbox_inches="tight")
     plt.close(fig)
 
@@ -111,7 +85,7 @@ def plot_roc(y_true, y_score, label, path):
     fig, ax = plt.subplots(figsize=(6, 5))
     ax.plot(fpr, tpr, lw=2, label=f"AUC={auc:.4f}")
     ax.plot([0, 1], [0, 1], "k--", alpha=0.5)
-    ax.set_xlabel("FPR"); ax.set_ylabel("TPR")
+    ax.set_xlabel("假阳性率"); ax.set_ylabel("真阳性率")
     ax.set_title(label); ax.legend(loc="lower right")
     ax.grid(True, linestyle="--", alpha=0.5)
     fig.tight_layout(); fig.savefig(path, dpi=200, bbox_inches="tight")
@@ -119,162 +93,128 @@ def plot_roc(y_true, y_score, label, path):
     return auc
 
 
-# =========================================================
 @torch.inference_mode()
 def main():
     print("=" * 60)
-    print("多层级临床验证")
+    print("超前 5 分钟心律失常预测 — 临床验证")
     print("=" * 60)
 
     val_dataset = load_sharded_datasets("val")
     val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False,
                             num_workers=0, pin_memory=True)
-    print(f"Val samples: {len(val_dataset)}")
+    print(f"验证样本数: {len(val_dataset)}")
 
-    model = HierarchicalHazardNet().to(device)
-    ckpt_path = "models/v20_master_best.pth"
+    model = ArrhythmiaWarningNet(n_windows=39).to(device)
+    ckpt_path = "models/arrhythmia_warning_best.pth"
     if not os.path.exists(ckpt_path):
-        print(f"ERROR: {ckpt_path} not found"); return
+        print(f"❌ 未找到 {ckpt_path}")
+        return
+
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    try:
-        missing, unexpected = model.load_state_dict(ckpt["ema"], strict=False)
-    except RuntimeError as e:
-        if 'size mismatch' in str(e):
-            print(f"Warning: size mismatch in checkpoint, loading compatible keys only")
-            model_dict = model.state_dict()
-            compatible = {}
-            skipped = []
-            for k, v in ckpt["ema"].items():
-                if k in model_dict and v.shape == model_dict[k].shape:
-                    compatible[k] = v
-                else:
-                    skipped.append(k)
-            missing, unexpected = model.load_state_dict(compatible, strict=False)
-            print(f"  Skipped {len(skipped)} incompatible keys")
-        else:
-            raise
+    missing, unexpected = model.load_state_dict(ckpt.get("ema", ckpt.get("model", {})), strict=False)
     if missing:
-        # V12.1 与旧 checkpoint 架构不同 — 允许新增层缺失（将随机初始化）
-        critical = [k for k in missing if not any(x in k for x in (
-            "heads.", "log_vars", "attention_query", "rhythm_head", "rhythm_envelope",
-            "criticality_head", "hazard_head", "tcn.", "temperature", "input_proj",
-            "stage4", "temporal_conv", "classifier", ".bn", "rr_encoder",
-        ))]
-        if critical:
-            raise RuntimeError(f"Model mismatch: missing keys {critical}")
+        non_critical = [k for k in missing if
+                        any(x in k for x in ["tcn_blocks", "skip_adapters",
+                                             "temporal_attn", "rr_encoder",
+                                             "env_encoder", "class_head"])]
+        if len(non_critical) == len(missing):
+            print(f"⚠️ {len(missing)} keys 缺失（新增层），随机初始化")
         else:
-            print(f"Warning: {len(missing)} keys missing from checkpoint (new architecture)")
+            print(f"⚠️ {len(missing)} keys 缺失")
+    if unexpected:
+        print(f"⚠️ {len(unexpected)} keys 未知（旧版残留）")
     model.eval()
 
-    # Collect
-    all_rhy_preds, all_rhy_targets, all_rhy_probs = [], [], []
-    all_cri_preds, all_cri_targets, all_cri_probs = [], [], []
-    all_haz_probs, all_haz_targets = [], []
-    # Warning Fusion 需要 aligned cri+haz，单独收集
-    all_fusion_cri_probs, all_fusion_cri_targets, all_fusion_haz_probs, all_fusion_haz_targets = [], [], [], []
+    all_probs, all_preds, all_targets = [], [], []
 
-    for bx, bx_rr, y_rhy, y_cri, y_haz, m_rhy, m_cri, m_haz in val_loader:
-        if not torch.isfinite(bx).all(): continue
+    for bx, bx_rr, y in val_loader:
+        if not torch.isfinite(bx).all():
+            continue
         bx = bx.to(device, dtype=torch.float32)
         bx_rr = bx_rr.to(device, dtype=torch.float32)
-        y_rhy = y_rhy.to(device); y_cri = y_cri.to(device); y_haz = y_haz.to(device)
-        m_rhy = m_rhy.to(device); m_cri = m_cri.to(device); m_haz = m_haz.to(device)
 
-        with torch.amp.autocast("cuda"):
-            out = model(bx, x_rr=bx_rr)["preds"]
-            r_logits = out["rhythm_logits"][:, -1]
-            c_logits = out["criticality_logits"][:, -1]
-            h_probs = out["hazard_probs"][:, -1]
+        with torch.amp.autocast("cuda" if device.type == "cuda" else "cpu"):
+            logits = model(bx, x_rr=bx_rr)["logits"]
 
-        idx = (m_rhy > 0.5).nonzero(as_tuple=True)[0]
-        if len(idx) > 0:
-            p = F.softmax(r_logits[idx].float(), dim=-1)
-            all_rhy_probs.extend(p.cpu().numpy())
-            all_rhy_preds.extend(torch.argmax(p, dim=-1).cpu().numpy())
-            all_rhy_targets.extend(y_rhy[idx].cpu().numpy())
+        probs = F.softmax(logits.float(), dim=-1)
+        all_probs.extend(probs.cpu().numpy())
+        all_preds.extend(torch.argmax(probs, dim=-1).cpu().numpy())
+        all_targets.extend(y.cpu().numpy())
 
-        idx = (m_cri > 0.5).nonzero(as_tuple=True)[0]
-        if len(idx) > 0:
-            p = F.softmax(c_logits[idx].float(), dim=-1)
-            all_cri_probs.extend(p.cpu().numpy())
-            all_cri_preds.extend(torch.argmax(p, dim=-1).cpu().numpy())
-            all_cri_targets.extend(y_cri[idx].cpu().numpy())
+    arr_preds = np.array(all_preds)
+    arr_targets = np.array(all_targets)
+    arr_probs = np.array(all_probs)
 
-        idx = (m_haz > 0.5).nonzero(as_tuple=True)[0]
-        if len(idx) > 0:
-            all_haz_probs.extend(h_probs[idx].float().cpu().numpy())
-            all_haz_targets.extend(y_haz[idx].cpu().numpy())
-            # 同时收集 cri 概率与标签用于 Fusion 对齐 + Safe→Hazard 细分
-            p = F.softmax(c_logits[idx].float(), dim=-1)
-            all_fusion_cri_probs.extend(p.cpu().numpy())
-            all_fusion_cri_targets.extend(y_cri[idx].cpu().numpy())
-            all_fusion_haz_probs.extend(h_probs[idx].float().cpu().numpy())
-            all_fusion_haz_targets.extend(y_haz[idx].cpu().numpy())
+    print(f"\n总样本数: {len(arr_targets)}")
+    for i, name in enumerate(CLASS_NAMES):
+        count = np.sum(arr_targets == i)
+        print(f"  {name}: {count} ({count/len(arr_targets)*100:.1f}%)")
 
-    arr_rhy_p = np.array(all_rhy_preds); arr_rhy_t = np.array(all_rhy_targets); arr_rhy_pr = np.array(all_rhy_probs)
-    arr_cri_p = np.array(all_cri_preds); arr_cri_t = np.array(all_cri_targets); arr_cri_pr = np.array(all_cri_probs)
-    arr_haz_p = np.array(all_haz_probs); arr_haz_t = np.array(all_haz_targets)
+    # ---- 混淆矩阵 ----
+    print("\n=== 混淆矩阵 ===")
+    plot_cm(arr_targets, arr_preds, CLASS_NAMES,
+            "心律失常预测混淆矩阵", "results/cm_6class.png")
+    print(classification_report(arr_targets, arr_preds,
+                                target_names=CLASS_NAMES, zero_division=0,
+                                digits=4))
 
-    print(f"Rhythm: {len(arr_rhy_t)}  Criticality: {len(arr_cri_t)}  Hazard: {len(arr_haz_t)}")
+    # ---- Per-class AUROC ----
+    print("\n=== Per-class AUROC (OvR) ===")
+    for i, name in enumerate(CLASS_NAMES):
+        y_bin = (arr_targets == i).astype(int)
+        if y_bin.sum() == 0:
+            print(f"  {name}: 无样本，跳过")
+            continue
+        try:
+            auc = roc_auc_score(y_bin, arr_probs[:, i])
+            print(f"  {name}: AUC = {auc:.4f}")
+        except:
+            pass
 
-    # ---- Rhythm ----
-    print("\n=== Rhythm ===")
-    rhy_n = ["Normal", "PVC", "室上性心律失常"]
-    rhy_labels = [0, 1, 2]
-    plot_cm(arr_rhy_t, arr_rhy_p, rhy_n, "Rhythm Confusion Matrix", "results/cm_rhythm.png", labels=rhy_labels)
-    print(classification_report(arr_rhy_t, arr_rhy_p, labels=rhy_labels, target_names=rhy_n, zero_division=0))
-    try: print(f"OVR Macro AUC: {roc_auc_score(arr_rhy_t, arr_rhy_pr, multi_class='ovr', average='macro'):.4f}")
-    except: pass
+    # ---- Per-class PR 曲线 ----
+    print("\n=== Per-class AUPRC ===")
+    for i, name in enumerate(CLASS_NAMES):
+        y_bin = (arr_targets == i).astype(int)
+        if y_bin.sum() == 0:
+            continue
+        ap = average_precision_score(y_bin, arr_probs[:, i])
+        print(f"  {name}: AP = {ap:.4f}")
+        plot_pr(y_bin, arr_probs[:, i], f"{name} PR Curve",
+                f"results/pr_{i}_{name.replace(' ', '_').replace('/', '_')}.png")
 
-    # ---- Criticality ----
-    print("\n=== Criticality ===")
-    cri_n = ["Safe", "PVC-Load", "VT", "VF"]
-    cri_labels = [0, 1, 2, 3]
-    plot_cm(arr_cri_t, arr_cri_p, cri_n, "Criticality Confusion Matrix", "results/cm_criticality.png", labels=cri_labels)
-    print(classification_report(arr_cri_t, arr_cri_p, labels=cri_labels, target_names=cri_n, zero_division=0))
-    try: print(f"OVR Macro AUC: {roc_auc_score(arr_cri_t, arr_cri_pr, multi_class='ovr', average='macro'):.4f}")
-    except: pass
-    for lbl, name in [(2, "VT"), (3, "VF")]:
-        if lbl in arr_cri_t:
-            m = arr_cri_t == lbl
-            print(f"{name} Recall: {(arr_cri_p[m] == lbl).mean():.4f}")
+    # ---- VT/VF 召回率 ----
+    print("\n=== 高危类别召回率 ===")
+    for cls_idx, name in [(4, "VT"), (3, "VF")]:
+        m = arr_targets == cls_idx
+        if m.sum() > 0:
+            recall = (arr_preds[m] == cls_idx).mean()
+            print(f"  {name} Recall: {recall:.4f}  ({m.sum()} samples)")
 
-    # ---- Hazard (continuous waveform deviation) ----
-    print("\n=== Hazard (Waveform Stability Deviation) ===")
-    for h_idx, h_name in enumerate(["dev_30s", "dev_1m", "dev_5m"]):
-        y_t = arr_haz_t[:, h_idx]; y_p = arr_haz_p[:, h_idx]
-        mse = np.mean((y_t - y_p) ** 2)
-        mae = np.mean(np.abs(y_t - y_p))
-        corr = np.corrcoef(y_t, y_p)[0, 1] if np.std(y_t) > 0 and np.std(y_p) > 0 else 0.0
-        print(f"  {h_name}: MSE={mse:.4f}  MAE={mae:.4f}  Corr={corr:.4f}  MeanTrue={y_t.mean():.4f}  MeanPred={y_p.mean():.4f}")
+    # ---- 可视化 CAM 示例 ----
+    print("\n=== 1D-CAM 可视化 ===")
+    try:
+        sample_batch = next(iter(val_loader))
+        bx, bx_rr, _ = sample_batch
+        bx = bx[:4].to(device, dtype=torch.float32)
+        bx_rr = bx_rr[:4].to(device, dtype=torch.float32)
+        with torch.amp.autocast("cuda" if device.type == "cuda" else "cpu"):
+            out = model(bx, x_rr=bx_rr)
+            cams = out["cam"].cpu().numpy()
 
-    # ---- Warning Fusion (危急度严重度加权 × Hazard 5m deviation) ----
-    fusion_cri_targets = np.array(all_fusion_cri_targets)
-    fusion_cri_probs  = np.array(all_fusion_cri_probs)
-    fusion_haz_probs  = np.array(all_fusion_haz_probs)
-    fusion_haz_targets = np.array(all_fusion_haz_targets)
+        fig, axes = plt.subplots(4, 1, figsize=(12, 8))
+        for i in range(4):
+            axes[i].fill_between(np.arange(len(cams[i])), cams[i], color='red', alpha=0.7)
+            axes[i].set_ylabel(f"Sample {i+1}")
+            axes[i].set_ylim(0, 1)
+        axes[-1].set_xlabel("时序窗口索引")
+        fig.suptitle("1D-CAM 注意力分布示例")
+        fig.tight_layout()
+        fig.savefig("results/cam_examples.png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+    except Exception as e:
+        print(f"  CAM 可视化失败: {e}")
 
-    print("\n=== Warning Fusion ===")
-    if len(all_fusion_cri_probs) > 0:
-        severity_weight = (fusion_cri_probs[:, 1] * 0.3 +
-                           fusion_cri_probs[:, 2] * 0.7 +
-                           fusion_cri_probs[:, 3] * 1.0)
-        eff = severity_weight * fusion_haz_probs[:, -1]
-        eff_true = severity_weight * fusion_haz_targets[:, -1]
-        mse_f = np.mean((eff_true - eff) ** 2)
-        corr_f = np.corrcoef(eff_true, eff)[0, 1] if np.std(eff_true) > 0 and np.std(eff) > 0 else 0.0
-        print(f"  Fusion MSE: {mse_f:.4f}  Corr: {corr_f:.4f}")
-
-        # Safe-only: waveform deviation when patient is currently safe
-        safe_mask = fusion_cri_targets == 0
-        if safe_mask.sum() > 0:
-            eff_s = severity_weight[safe_mask] * fusion_haz_probs[safe_mask, -1]
-            eff_s_true = severity_weight[safe_mask] * fusion_haz_targets[safe_mask, -1]
-            mse_sf = np.mean((eff_s_true - eff_s) ** 2)
-            corr_sf = np.corrcoef(eff_s_true, eff_s)[0, 1] if np.std(eff_s_true) > 0 and np.std(eff_s) > 0 else 0.0
-            print(f"  Safe→Deterioration  MSE: {mse_sf:.4f}  Corr: {corr_sf:.4f}")
-
-    print("\nDone — see results/")
+    print("\n✅ 评估完成。结果保存在 results/")
     for f in sorted(glob.glob("results/*.png")):
         print(f"  {f}")
 

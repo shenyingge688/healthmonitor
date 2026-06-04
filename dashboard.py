@@ -33,12 +33,12 @@ clinical_cases = {
     "209":   {"label": "案例三：房性心动过速 / 室上速 (AT / SVT)",
               "desc": "阵发性房速与室上性心动过速交替出现，窄 QRS 心动过速，验证室上性分类的稳定性。",
               "default_start": 10.0, "db": "mitdb"},
-    "04015": {"label": "案例四：持续性心房颤动 (AF)",
-              "desc": "长程房颤记录（10 小时以上），RR 间期绝对不齐，评估室上性分类在长程监测中的一致性。",
-              "default_start": 10.0, "db": "afdb"},
-    "421":   {"label": "案例五：持续性室性心动过速 (VT)",
-              "desc": "持续室性心动过速发作，宽 QRS 心动过速，验证危急度分类对高危事件的响应能力。",
-              "default_start": 23.0, "db": "vfdb"},
+    "201":   {"label": "案例四：阵发性心房颤动 (AFib)",
+              "desc": "MIT-BIH 201 号记录，阵发性房颤发作，RR 间期绝对不齐，P 波消失，f 波显现。",
+              "default_start": 10.0, "db": "mitdb"},
+    "207":   {"label": "案例五：室性心动过速 / 室扑 (VT / VFl)",
+              "desc": "MIT-BIH 207 号记录，短阵室速与心室扑动交替，宽 QRS 心动过速，高危节律样本。",
+              "default_start": 12.0, "db": "mitdb"},
 }
 
 selected_id = st.sidebar.selectbox(
@@ -46,10 +46,10 @@ selected_id = st.sidebar.selectbox(
     format_func=lambda x: clinical_cases[x]["label"]
 )
 start_mins = st.sidebar.slider(
-    "推演起始点 (分钟)", 10.0, 25.0,
+    "推演起始点 (分钟)", 10.0, 16.0,
     clinical_cases[selected_id]["default_start"], 0.5
 )
-st.sidebar.caption("前 10 分钟用于建立基线参考。")
+st.sidebar.caption("前 10 分钟用于建立基线参考。上限 16 分钟（需预留 12 分钟缓冲）。")
 
 if st.sidebar.button("清空追踪日志", use_container_width=True):
     st.session_state.anomaly_logs = []
@@ -70,10 +70,9 @@ def load_sim_data(rec_id, db):
     if not os.path.exists(rec_path + ".dat"):
         return np.zeros(300000)
     if db == 'mitdb':
-        record = wfdb.rdrecord(rec_path, sampto=int(20 * 60 * 360))
+        record = wfdb.rdrecord(rec_path, sampto=int(30 * 60 * 360))
         src_fs = 360
     elif db == 'vfdb':
-        # VFDB: full 35-min record for VT peak access
         record = wfdb.rdrecord(rec_path)
         src_fs = record.fs if hasattr(record, 'fs') and record.fs else 250
     else:
@@ -92,21 +91,24 @@ st.title(f"心电监护预警终端 — {clinical_cases[selected_id]['label']}")
 st.caption(f"**病史/体征**：{clinical_cases[selected_id]['desc']}")
 
 # =========================================================
-# Unified classification
+# Layout
 # =========================================================
+status_placeholder = st.empty()
 diag_placeholder = st.empty()
 
 col1, col2 = st.columns([3, 2])
 with col1:
     st.markdown("### 实时心电波形 (250Hz 单导联)")
     chart_placeholder = st.empty()
-    st.markdown("### 演变趋势")
+    st.markdown("### 心律失常概率演变趋势")
     traj_placeholder = st.empty()
+    st.markdown("### 病灶溯源热力图 (1D-CAM)")
+    cam_placeholder = st.empty()
 
 with col2:
     st.markdown("### 推演时间")
     metric_time = st.empty()
-    st.markdown("### 临床诊断")
+    st.markdown("### 预警诊断")
     class_placeholder = st.empty()
 
 st.divider()
@@ -114,30 +116,27 @@ st.markdown("### 事件日志")
 log_placeholder = st.empty()
 
 # =========================================================
-# Unified classification
+# Constants
 # =========================================================
-def unified_diagnosis(rhythm, crit):
-    """综合节律分类与危急度评估，输出主导诊断"""
-    candidates = [
-        ("正常窦性心律 (NSR)", rhythm[0], "#10B981"),
-        ("室性期前收缩 (PVC)", rhythm[1], "#F59E0B"),
-        ("室上性心律失常 (AF / AFl / AT / SVT)", rhythm[2], "#F97316"),
-        ("室性心动过速 (VT)", crit[2], "#EF4444"),
-        ("心室颤动 (VF)", crit[3], "#991B1B"),
-    ]
-    diag, conf, color = max(candidates, key=lambda x: x[1])
-    if conf < 0.5:
-        return "信号质量不足", conf, "#94A3B8"
-    return diag, conf, color
-
-# Unified class display
-UNI_CLASSES = [
-    ("正常窦性心律 (NSR)",                        lambda r, c: r[0], "#10B981"),
-    ("室性期前收缩 (PVC)",                         lambda r, c: r[1], "#F59E0B"),
-    ("室上性心律失常 (AF / AFl / AT / SVT)",           lambda r, c: r[2], "#F97316"),
-    ("室性心动过速 (VT)",                         lambda r, c: c[2], "#EF4444"),
-    ("心室颤动 (VF)",                              lambda r, c: c[3], "#991B1B"),
+CLASS_NAMES = [
+    "正常窦性心律", "室性早搏 (PVC)", "心房颤动 (AFib)",
+    "心室颤动 (VF)", "室性心动过速 (VT)", "房速/室上速 (AT/SVT)"
 ]
+
+CLASS_COLORS = [
+    "#10B981", "#F59E0B", "#F97316",
+    "#991B1B", "#EF4444", "#EAB308"
+]
+
+INFERENCE_MAP = {
+    0: {"title": "未见明显节律异常", "color": "#10B981"},
+    1: {"title": "室性期前收缩 (PVC) 风险", "color": "#F59E0B"},
+    2: {"title": "心房颤动 (AFib) 风险", "color": "#F97316"},
+    3: {"title": "心室颤动 (VF) 风险", "color": "#991B1B"},
+    4: {"title": "室性心动过速 (VT) 风险", "color": "#EF4444"},
+    5: {"title": "房速/室上速 (AT/SVT) 风险", "color": "#EAB308"},
+}
+
 
 def bar_html(label, prob, color):
     p = min(float(prob), 1.0)
@@ -145,7 +144,7 @@ def bar_html(label, prob, color):
     c = color if p > 0.03 else "rgba(255,255,255,0.12)"
     return (
         f"<div style='display:flex;align-items:center;margin-bottom:4px;font-size:12px;'>"
-        f"<span style='width:180px;color:#E2E8F0;'>{label}</span>"
+        f"<span style='width:170px;color:#E2E8F0;'>{label}</span>"
         f"<div style='flex:1;background:rgba(0,0,0,0.3);height:7px;border-radius:3px;margin:0 8px;'>"
         f"<div style='width:{w}%;background:{c};height:100%;border-radius:3px;'></div>"
         f"</div>"
@@ -153,25 +152,26 @@ def bar_html(label, prob, color):
         f"</div>"
     )
 
+
 # =========================================================
 # Simulation Loop
 # =========================================================
+
 if st.sidebar.button("启动数据推流", use_container_width=True):
     sim_step = 0
     base_offset_pts = int(start_mins * 60 * 250)
     ecg_buffer = np.full(1000, np.nan)
     display_len, step_size, refresh_rate = 1000, 20, 0.08
 
-    rhy_hist = deque(maxlen=5)
-    cri_hist = deque(maxlen=5)
-    risk_history = deque([0.0] * 10, maxlen=10)
+    prob_history = list(deque(maxlen=60))      # 60 帧概率历史 (~60s)
+    pred_class_prev = 0
 
     while True:
         current_pts = base_offset_pts + (sim_step * step_size)
         if current_pts >= len(data_source) - 1:
             break
 
-        # ECG
+        # ECG buffer
         new_data = data_source[current_pts - step_size : current_pts]
         idx = (sim_step * step_size) % display_len
         ecg_buffer[idx : idx + step_size] = new_data
@@ -195,87 +195,117 @@ if st.sidebar.button("启动数据推流", use_container_width=True):
         cur_sec = current_pts / 250
         metric_time.metric("当前扫描线", f"{int(cur_sec // 60):02d}:{int(cur_sec % 60):02d}")
 
-        # API
+        # API call (~1 Hz)
         if sim_step % 12 == 0:
-            full_win = data_source[max(0, current_pts - 150000) : current_pts]
-            if len(full_win) < 150000:
-                full_win = np.pad(full_win, (150000 - len(full_win), 0), 'constant')
+            full_win = data_source[max(0, current_pts - 180000) : current_pts]
+            if len(full_win) < 180000:
+                full_win = np.pad(full_win, (180000 - len(full_win), 0), 'constant')
 
             try:
                 resp = requests.post("http://127.0.0.1:8000/api/predict",
-                                     json={"ecg": full_win.tolist()}, timeout=5)
-                if resp.status_code == 200:
-                    d = resp.json()
-                    rhy_hist.append(d.get('rhythm', [1, 0, 0]))
-                    cri_hist.append(d.get('criticality', [1, 0, 0, 0]))
-                    risk_history.append(d.get('risk_trajectory', 0.0))
+                                     json={"ecg": full_win.tolist()}, timeout=10)
+                resp.raise_for_status()
+                d = resp.json()
+                pred_class = d["pred_class"]
+                probs = d["probabilities"]
+                cam_data = d.get("cam", [])
+                prob_history.append(probs)
             except Exception:
-                pass
+                pred_class = pred_class_prev
+                cam_data = []
+        else:
+            pred_class = pred_class_prev
+            cam_data = []
 
-            if rhy_hist:
-                rhythm = np.mean(list(rhy_hist), axis=0).tolist()
-                crit = np.mean(list(cri_hist), axis=0).tolist()
-            else:
-                rhythm, crit = [1, 0, 0], [1, 0, 0, 0]
+        # ---- 预警诊断 ----
+        diag_info = INFERENCE_MAP.get(pred_class, INFERENCE_MAP[0])
+        diag_placeholder.markdown(
+            f"<div style='background:#1E1E28;padding:20px 28px;border-radius:10px;"
+            f"border-left:10px solid {diag_info['color']};box-shadow:0 4px 12px rgba(0,0,0,0.3);'>"
+            f"<h1 style='margin:0;color:{diag_info['color']};font-size:26px;font-weight:700;'>{diag_info['title']}</h1>"
+            f"<p style='margin:6px 0 0;color:#94A3B8;font-size:14px;'>未来 5 分钟预警</p></div>",
+            unsafe_allow_html=True
+        )
 
-            # ---- 综合诊断 ----
-            diag, conf, color = unified_diagnosis(rhythm, crit)
-
-            diag_placeholder.markdown(
-                f"<div style='background:#1E1E28;padding:20px 28px;border-radius:10px;"
-                f"border-left:10px solid {color};box-shadow:0 4px 12px rgba(0,0,0,0.3);'>"
-                f"<h1 style='margin:0;color:{color};font-size:26px;font-weight:700;'>{diag}</h1>"
-                f"<p style='margin:6px 0 0;color:#94A3B8;font-size:14px;'>"
-                f"置信度 {conf*100:.1f}%</p></div>",
-                unsafe_allow_html=True
-            )
-
-            # Unified probability bars
+        # ---- 概率分布条 ----
+        if prob_history:
+            probs_now = prob_history[-1]
             bars = ""
-            for label, fn, c in UNI_CLASSES:
-                bars += bar_html(label, fn(rhythm, crit), c)
+            for i, name in enumerate(CLASS_NAMES):
+                bars += bar_html(name, probs_now[i], CLASS_COLORS[i])
             class_placeholder.markdown(
                 f"<div style='background:#1E1E28;padding:12px 16px;border-radius:6px;'>{bars}</div>",
                 unsafe_allow_html=True
             )
 
-            # Risk trend
-            traj_list = list(risk_history)
-            t_axis = np.linspace(-len(traj_list) + 1, 0, len(traj_list))
-            df_traj = pd.DataFrame({'Time': t_axis, 'Risk': traj_list})
+        # ---- 概率演变趋势 (堆叠面积图) ----
+        if len(prob_history) > 1:
+            df_traj = pd.DataFrame(prob_history, columns=CLASS_NAMES)
+            t_axis = np.linspace(-len(prob_history) + 1, 0, len(prob_history))
+            df_traj['Time'] = t_axis
+
+            df_long = df_traj.melt('Time', var_name='类别', value_name='概率')
             traj_placeholder.altair_chart(
-                alt.Chart(df_traj).mark_area(
-                    color=alt.Gradient(gradient='linear', stops=[
-                        alt.GradientStop(color='rgba(239,68,68,0.05)', offset=0),
-                        alt.GradientStop(color='rgba(239,68,68,0.6)', offset=1)
-                    ]), line={'color': '#EF4444'}
-                ).encode(
-                    x=alt.X('Time:Q', axis=alt.Axis(title="历史", grid=False)),
-                    y=alt.Y('Risk:Q', scale=alt.Scale(domain=[0, 1]),
-                            axis=alt.Axis(title="风险", format='%'))
-                ).properties(height=100).configure_view(strokeOpacity=0),
+                alt.Chart(df_long).mark_area(opacity=0.7).encode(
+                    x=alt.X('Time:Q', axis=alt.Axis(title="时间 (步)", grid=False)),
+                    y=alt.Y('概率:Q', scale=alt.Scale(domain=[0, 1]),
+                            axis=alt.Axis(title="概率", format='%')),
+                    color=alt.Color('类别:N',
+                                    scale=alt.Scale(
+                                        domain=CLASS_NAMES,
+                                        range=CLASS_COLORS),
+                                    legend=alt.Legend(orient='bottom', columns=3))
+                ).properties(height=140).configure_view(strokeOpacity=0),
                 use_container_width=True
             )
 
-            # Log
-            if crit[2] > 0.3 or crit[3] > 0.3 or (rhythm[2] > 0.5):
-                ts = f"{int(cur_sec // 60):02d}:{int(cur_sec % 60):02d}"
-                st.session_state.anomaly_logs.append({"time": ts, "title": diag})
+        # ---- 1D-CAM 热力图 ----
+        if cam_data and len(cam_data) > 1:
+            df_cam = pd.DataFrame({'TimeStep': np.arange(len(cam_data)), 'Attention': cam_data})
+            cam_placeholder.altair_chart(
+                alt.Chart(df_cam).mark_area(
+                    color=alt.Gradient(gradient='linear', stops=[
+                        alt.GradientStop(color='#000000', offset=0),
+                        alt.GradientStop(color='#FF4444', offset=1)
+                    ])
+                ).encode(
+                    x=alt.X('TimeStep:Q', axis=alt.Axis(labels=False, title="时序注意力分布")),
+                    y=alt.Y('Attention:Q', scale=alt.Scale(domain=[0, 1.0]), axis=None)
+                ).properties(height=50).configure_view(strokeOpacity=0),
+                use_container_width=True
+            )
+
+        # ---- 事件日志 ----
+        if pred_class != 0:
+            ts = f"{int(cur_sec // 60):02d}:{int(cur_sec % 60):02d}"
+            diag_title = CLASS_NAMES[pred_class]
+            # 仅在新事件或类别切换时才记录
+            if not st.session_state.anomaly_logs or \
+               st.session_state.anomaly_logs[-1].get("class") != pred_class:
+                st.session_state.anomaly_logs.append({
+                    "time": ts, "title": diag_title, "class": pred_class
+                })
                 if len(st.session_state.anomaly_logs) > 20:
                     st.session_state.anomaly_logs = st.session_state.anomaly_logs[-20:]
-                lines = []
-                for e in reversed(st.session_state.anomaly_logs):
-                    lines.append(
-                        f"<div style='padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);"
-                        f"font-size:12px;color:#94A3B8;'>"
-                        f"<span style='color:#F59E0B;font-family:monospace;'>{e['time']}</span> "
-                        f"— {e['title']}</div>"
-                    )
-                log_placeholder.markdown(
-                    f"<div style='max-height:240px;overflow-y:auto;'>{''.join(lines)}</div>",
-                    unsafe_allow_html=True
-                )
 
+        if st.session_state.anomaly_logs:
+            lines = []
+            for e in reversed(st.session_state.anomaly_logs):
+                c = CLASS_COLORS.get(e.get("class", 0), "#94A3B8")
+                lines.append(
+                    f"<div style='padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);"
+                    f"font-size:12px;color:#94A3B8;'>"
+                    f"<span style='color:#F59E0B;font-family:monospace;'>{e['time']}</span> "
+                    f"— <span style='color:{c};'>{e['title']}</span></div>"
+                )
+            log_placeholder.markdown(
+                f"<div style='max-height:240px;overflow-y:auto;'>{''.join(lines)}</div>",
+                unsafe_allow_html=True
+            )
+        else:
+            log_placeholder.info("✅ 当前监测时段内未检测到异常节律。")
+
+        pred_class_prev = pred_class
         sim_step += 1
         time.sleep(refresh_rate)
 else:
