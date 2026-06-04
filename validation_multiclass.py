@@ -1,8 +1,8 @@
 """
-validation_multiclass.py — 全量多层级临床验证 (V14)
+validation_multiclass.py — 全量多层级临床验证
 
 评估内容:
-  1. Rhythm (4-class)          混淆矩阵 + per-class P/R/F1 + OVR AUC
+  1. Rhythm (3-class)          混淆矩阵 + per-class P/R/F1 + OVR AUC
   2. Criticality (4-class)     混淆矩阵 + VT/VF 召回率 + OVR AUC
   3. Hazard (3-label)          Per-horizon AUPRC/AUC + 校准曲线 + Brier Score
   4. Warning Fusion            effective_risk ROC / AUPRC
@@ -37,16 +37,26 @@ os.makedirs("results", exist_ok=True)
 
 # =========================================================
 def load_sharded_datasets(split_prefix="val"):
-    shard_paths = glob.glob(f"dataset/v13_*_{split_prefix}_shard_*.pt")
+    shard_paths = glob.glob(f"dataset/v15_*_{split_prefix}_shard_*.pt")
     datasets = []
     names = [__import__('os').path.basename(p) for p in shard_paths]
     print(f"  found {len(shard_paths)} shards: {names}")
     for path in shard_paths:
         data = torch.load(path, map_location="cpu", weights_only=True)
-        datasets.append(TensorDataset(
-            data["X"], data["Y_rhythm"], data["Y_criticality"], data["Y_hazard"],
-            data["M_rhythm"], data["M_criticality"], data["M_hazard"],
-        ))
+        has_rr = "X_rr" in data
+        if has_rr:
+            datasets.append(TensorDataset(
+                data["X"], data["X_rr"],
+                data["Y_rhythm"], data["Y_criticality"], data["Y_hazard"],
+                data["M_rhythm"], data["M_criticality"], data["M_hazard"],
+            ))
+        else:
+            dummy_rr = torch.zeros(len(data["X"]), 19, 9, dtype=torch.float16)
+            datasets.append(TensorDataset(
+                data["X"], dummy_rr,
+                data["Y_rhythm"], data["Y_criticality"], data["Y_hazard"],
+                data["M_rhythm"], data["M_criticality"], data["M_hazard"],
+            ))
     return ConcatDataset(datasets)
 
 
@@ -113,7 +123,7 @@ def plot_roc(y_true, y_score, label, path):
 @torch.inference_mode()
 def main():
     print("=" * 60)
-    print("V16 Multi-Level Clinical Validation")
+    print("多层级临床验证")
     print("=" * 60)
 
     val_dataset = load_sharded_datasets("val")
@@ -122,7 +132,7 @@ def main():
     print(f"Val samples: {len(val_dataset)}")
 
     model = HierarchicalHazardNet().to(device)
-    ckpt_path = "models/v10_master_best.pth"
+    ckpt_path = "models/v20_master_best.pth"
     if not os.path.exists(ckpt_path):
         print(f"ERROR: {ckpt_path} not found"); return
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
@@ -148,7 +158,7 @@ def main():
         critical = [k for k in missing if not any(x in k for x in (
             "heads.", "log_vars", "attention_query", "rhythm_head", "rhythm_envelope",
             "criticality_head", "hazard_head", "tcn.", "temperature", "input_proj",
-            "stage4", "temporal_conv", "classifier", ".bn",
+            "stage4", "temporal_conv", "classifier", ".bn", "rr_encoder",
         ))]
         if critical:
             raise RuntimeError(f"Model mismatch: missing keys {critical}")
@@ -163,14 +173,15 @@ def main():
     # Warning Fusion 需要 aligned cri+haz，单独收集
     all_fusion_cri_probs, all_fusion_cri_targets, all_fusion_haz_probs, all_fusion_haz_targets = [], [], [], []
 
-    for bx, y_rhy, y_cri, y_haz, m_rhy, m_cri, m_haz in val_loader:
+    for bx, bx_rr, y_rhy, y_cri, y_haz, m_rhy, m_cri, m_haz in val_loader:
         if not torch.isfinite(bx).all(): continue
         bx = bx.to(device, dtype=torch.float32)
+        bx_rr = bx_rr.to(device, dtype=torch.float32)
         y_rhy = y_rhy.to(device); y_cri = y_cri.to(device); y_haz = y_haz.to(device)
         m_rhy = m_rhy.to(device); m_cri = m_cri.to(device); m_haz = m_haz.to(device)
 
         with torch.amp.autocast("cuda"):
-            out = model(bx)["preds"]
+            out = model(bx, x_rr=bx_rr)["preds"]
             r_logits = out["rhythm_logits"][:, -1]
             c_logits = out["criticality_logits"][:, -1]
             h_probs = out["hazard_probs"][:, -1]
@@ -208,8 +219,8 @@ def main():
 
     # ---- Rhythm ----
     print("\n=== Rhythm ===")
-    rhy_n = ["Normal", "PVC", "AFIB", "SVT/AT"]
-    rhy_labels = [0, 1, 2, 3]
+    rhy_n = ["Normal", "PVC", "室上性心律失常"]
+    rhy_labels = [0, 1, 2]
     plot_cm(arr_rhy_t, arr_rhy_p, rhy_n, "Rhythm Confusion Matrix", "results/cm_rhythm.png", labels=rhy_labels)
     print(classification_report(arr_rhy_t, arr_rhy_p, labels=rhy_labels, target_names=rhy_n, zero_division=0))
     try: print(f"OVR Macro AUC: {roc_auc_score(arr_rhy_t, arr_rhy_pr, multi_class='ovr', average='macro'):.4f}")
@@ -228,56 +239,40 @@ def main():
             m = arr_cri_t == lbl
             print(f"{name} Recall: {(arr_cri_p[m] == lbl).mean():.4f}")
 
-    # ---- Hazard ----
-    print("\n=== Hazard ===")
-    for h_idx, h_name in enumerate(["30s", "1m", "5m"]):
+    # ---- Hazard (continuous waveform deviation) ----
+    print("\n=== Hazard (Waveform Stability Deviation) ===")
+    for h_idx, h_name in enumerate(["dev_30s", "dev_1m", "dev_5m"]):
         y_t = arr_haz_t[:, h_idx]; y_p = arr_haz_p[:, h_idx]
-        pos_rate = y_t.mean()
-        if y_t.sum() == 0: print(f"  {h_name}: no positives"); continue
-        ap = plot_pr(y_t, y_p, f"Hazard {h_name} PR", f"results/pr_hazard_{h_name}.png")
-        try: auc = roc_auc_score(y_t, y_p)
-        except: auc = 0.0
-        b = brier_score_loss(y_t, y_p)
-        print(f"  {h_name}: AUPRC={ap:.4f}  AUC={auc:.4f}  Brier={b:.4f}  PosRate={pos_rate:.2%}")
+        mse = np.mean((y_t - y_p) ** 2)
+        mae = np.mean(np.abs(y_t - y_p))
+        corr = np.corrcoef(y_t, y_p)[0, 1] if np.std(y_t) > 0 and np.std(y_p) > 0 else 0.0
+        print(f"  {h_name}: MSE={mse:.4f}  MAE={mae:.4f}  Corr={corr:.4f}  MeanTrue={y_t.mean():.4f}  MeanPred={y_p.mean():.4f}")
 
-    # Safe→Hazard only (排除已发作危机样本的真·提前预警)
+    # ---- Warning Fusion (危急度严重度加权 × Hazard 5m deviation) ----
     fusion_cri_targets = np.array(all_fusion_cri_targets)
     fusion_cri_probs  = np.array(all_fusion_cri_probs)
     fusion_haz_probs  = np.array(all_fusion_haz_probs)
     fusion_haz_targets = np.array(all_fusion_haz_targets)
 
-    safe_mask = fusion_cri_targets == 0
-    if safe_mask.sum() > 0:
-        print(f"\n--- Safe→Hazard (true early warning, n={safe_mask.sum()}) ---")
-        for h_idx, h_name in enumerate(["30s", "1m", "5m"]):
-            y_t_s = fusion_haz_targets[safe_mask, h_idx]
-            y_p_s = fusion_haz_probs[safe_mask, h_idx]
-            pos_rate_s = y_t_s.mean()
-            if y_t_s.sum() == 0: print(f"  {h_name}: no positives"); continue
-            try: ap_s = average_precision_score(y_t_s, y_p_s)
-            except: ap_s = 0.0
-            print(f"  {h_name}: AUPRC={ap_s:.4f}  PosRate={pos_rate_s:.2%}")
-
-    if arr_haz_t[:, -1].sum() > 0:
-        plot_cal(arr_haz_t[:, -1], arr_haz_p[:, -1], title="Hazard 5m Calibration", path="results/cal_hazard_5m.png")
-
-    # ---- Warning Fusion (危急度严重度加权 × Hazard 5m) ----
     print("\n=== Warning Fusion ===")
     if len(all_fusion_cri_probs) > 0:
-        # severity weights: PVC-Load=0.3, VT=0.7, VF=1.0
         severity_weight = (fusion_cri_probs[:, 1] * 0.3 +
                            fusion_cri_probs[:, 2] * 0.7 +
                            fusion_cri_probs[:, 3] * 1.0)
         eff = severity_weight * fusion_haz_probs[:, -1]
-        y_col = (fusion_haz_targets[:, -1] > 0.5).astype(int)
-        if y_col.sum() > 0:
-            plot_roc(y_col, eff, "Warning Fusion ROC", "results/roc_warning_fusion.png")
-            print(f"  Fusion AUPRC (severity-weighted): {average_precision_score(y_col, eff):.4f}")
-        # Safe-only fusion
-        if safe_mask.sum() > 0 and fusion_haz_targets[safe_mask, -1].sum() > 0:
+        eff_true = severity_weight * fusion_haz_targets[:, -1]
+        mse_f = np.mean((eff_true - eff) ** 2)
+        corr_f = np.corrcoef(eff_true, eff)[0, 1] if np.std(eff_true) > 0 and np.std(eff) > 0 else 0.0
+        print(f"  Fusion MSE: {mse_f:.4f}  Corr: {corr_f:.4f}")
+
+        # Safe-only: waveform deviation when patient is currently safe
+        safe_mask = fusion_cri_targets == 0
+        if safe_mask.sum() > 0:
             eff_s = severity_weight[safe_mask] * fusion_haz_probs[safe_mask, -1]
-            y_s  = (fusion_haz_targets[safe_mask, -1] > 0.5).astype(int)
-            print(f"  Safe→Hazard Fusion AUPRC:         {average_precision_score(y_s, eff_s):.4f}")
+            eff_s_true = severity_weight[safe_mask] * fusion_haz_targets[safe_mask, -1]
+            mse_sf = np.mean((eff_s_true - eff_s) ** 2)
+            corr_sf = np.corrcoef(eff_s_true, eff_s)[0, 1] if np.std(eff_s_true) > 0 and np.std(eff_s) > 0 else 0.0
+            print(f"  Safe→Deterioration  MSE: {mse_sf:.4f}  Corr: {corr_sf:.4f}")
 
     print("\nDone — see results/")
     for f in sorted(glob.glob("results/*.png")):

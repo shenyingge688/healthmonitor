@@ -1,6 +1,6 @@
 ﻿"""
 Script: pretrain_cnn_ptbxl.py
-Phase 1 - PTB-XL CNN 骨干网络预训练引擎 (适配 V10.1 架构)
+Phase 1 - PTB-XL CNN 骨干网络预训练引擎
 """
 import torch
 import torch.nn as nn
@@ -10,21 +10,21 @@ from tqdm import tqdm
 import os
 import warnings
 
-# 导入 V10 架构里全新的“眼睛”
+# 导入 WindowEncoder 骨干网络
 from dl_model import WindowEncoder 
 
 warnings.filterwarnings("ignore")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"👁️ 启动 PTB-XL 形态学宗师预训练中心 (V10 适配版)... [运算核心: {device}]")
+print(f"👁️ 启动 PTB-XL 形态学预训练... [运算核心: {device}]")
 
 class PretrainClassifier(nn.Module):
     def __init__(self):
         super().__init__()
-        # V10 的 WindowEncoder 默认输出 embed_dim=256
+        # WindowEncoder 默认输出 embed_dim=256
         self.encoder = WindowEncoder(in_channels=1, embed_dim=256)
         self.head = nn.Sequential(
             nn.Dropout(0.5),
-            # 🚀 核心修改：接收来自 V10 Encoder 的 256 维特征
+            # 接收来自 Encoder 的 256 维特征
             nn.Linear(256, 64), 
             nn.ReLU(),
             nn.Linear(64, 5) # 输出 PTB-XL 的 5 个超级类
@@ -61,7 +61,7 @@ def main():
         pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}", dynamic_ncols=True)
         
         for bx, by in pbar:
-            # 适配 V10 的 Float16/Float32 显存策略
+            # 适配 Float16/Float32 显存策略
             bx = bx.to(device, dtype=torch.float32) 
             by = by.to(device, dtype=torch.float32)
             
@@ -95,7 +95,7 @@ def main():
         
         if val_auc > best_auc:
             best_auc = val_auc
-            # 剥离 V10 版本的 Encoder 权重并保存
+            # 剥离 Encoder 权重并保存
             torch.save(model.encoder.state_dict(), 'models/ptbxl_backbone.pth')
             print(f"🌟 新纪录！已成功剥离并保存最优底层权重至 models/ptbxl_backbone.pth")
 

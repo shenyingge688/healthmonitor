@@ -1,6 +1,6 @@
 """
-HealthMonitor V3.1 - 硬件直通接口验证脚本
-功能描述：从本地采集的示波器 csv 文档读入测试点，清洗后转发至后端接口以效验物理通信回路。
+心电智能监护系统 - 硬件直通接口验证脚本
+功能描述：从本地采集的示波器 csv 文档读入测试点，清洗后转发至后端接口以校验物理通信回路。
 """
 import sys
 import pandas as pd
@@ -44,7 +44,7 @@ def test_via_api(ecg_array):
         )
         if resp.status_code == 200:
             result = resp.json()
-            print("🔗 网关回执结果呈现 (V10 分层诊断):")
+            print("🔗 网关回执结果呈现 (分层诊断):")
             print(f"- 节律分布 (Rhythm):     {np.round(np.array(result['rhythm'])*100, 1)}")
             print(f"- 危急评估 (Criticality): {np.round(np.array(result['criticality'])*100, 1)}")
             print(f"- 生存预警 (Hazard):     {np.round(np.array(result['hazard'])*100, 1)}")
