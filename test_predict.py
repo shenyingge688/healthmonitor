@@ -9,7 +9,7 @@ from main import build_window_sequence, device
 
 print(f"Device: {device}")
 print(f"Model loading...")
-model = ArrhythmiaWarningNet(n_windows=39).to(device).eval()
+model = ArrhythmiaWarningNet().to(device).eval()
 print(f"Model OK, params: {sum(p.numel() for p in model.parameters()):,}")
 
 # 模拟全零输入
@@ -41,13 +41,14 @@ try:
             out = model(bx, x_rr=bx_rr)
     print(f"[4] forward OK")
 
-    # Step 5
-    logits = out["logits"][0].float()
+    # Step 5 (V6 dual-head output)
+    probs_fut = out["probs_fut"][0].float()
+    probs_cur = out["probs_cur"][0].float()
     cam = out["cam"][0].float()
-    probs = torch.softmax(logits, dim=-1)
-    print(f"[5] logits={logits.shape} probs={probs.tolist()}")
+    print(f"[5] probs_fut={probs_fut.tolist()}")
+    print(f"[5] probs_cur={probs_cur.tolist()}")
 
-    print("\n✅ ALL OK")
+    print("\n[OK] ALL OK")
 except Exception as e:
-    print(f"\n❌ FAILED at step above")
+    print(f"\n[FAIL] FAILED at step above")
     traceback.print_exc()

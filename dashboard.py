@@ -13,6 +13,8 @@ from scipy import signal
 from scipy.signal import butter, filtfilt
 import os
 
+from constants import CLASS_NAMES, CLASS_COLORS, INFERENCE_MAP
+
 st.set_page_config(page_title="心电监护预警系统", layout="wide")
 
 if 'anomaly_logs' not in st.session_state:
@@ -116,26 +118,8 @@ st.markdown("### 事件日志")
 log_placeholder = st.empty()
 
 # =========================================================
-# Constants
+# Class scheme imported from constants.py (single source of truth)
 # =========================================================
-CLASS_NAMES = [
-    "正常窦性心律", "室性早搏 (PVC)", "心房颤动 (AFib)",
-    "心室颤动 (VF)", "室性心动过速 (VT)", "房速/室上速 (AT/SVT)"
-]
-
-CLASS_COLORS = [
-    "#10B981", "#F59E0B", "#F97316",
-    "#991B1B", "#EF4444", "#EAB308"
-]
-
-INFERENCE_MAP = {
-    0: {"title": "未见明显节律异常", "color": "#10B981"},
-    1: {"title": "室性期前收缩 (PVC) 风险", "color": "#F59E0B"},
-    2: {"title": "心房颤动 (AFib) 风险", "color": "#F97316"},
-    3: {"title": "心室颤动 (VF) 风险", "color": "#991B1B"},
-    4: {"title": "室性心动过速 (VT) 风险", "color": "#EF4444"},
-    5: {"title": "房速/室上速 (AT/SVT) 风险", "color": "#EAB308"},
-}
 
 
 def bar_html(label, prob, color):
@@ -163,8 +147,9 @@ if st.sidebar.button("启动数据推流", use_container_width=True):
     ecg_buffer = np.full(1000, np.nan)
     display_len, step_size, refresh_rate = 1000, 20, 0.08
 
-    prob_history = list(deque(maxlen=60))      # 60 帧概率历史 (~60s)
+    prob_history = deque(maxlen=60)      # 60 帧概率历史 (~60s), 环形缓冲
     pred_class_prev = 0
+    cur_class = 0
 
     while True:
         current_pts = base_offset_pts + (sim_step * step_size)
@@ -206,7 +191,8 @@ if st.sidebar.button("启动数据推流", use_container_width=True):
                                      json={"ecg": full_win.tolist()}, timeout=10)
                 resp.raise_for_status()
                 d = resp.json()
-                pred_class = d["pred_class"]
+                pred_class = d["pred_class"]               # future tendency
+                cur_class = d.get("current_class", pred_class)  # current rhythm
                 probs = d["probabilities"]
                 cam_data = d.get("cam", [])
                 prob_history.append(probs)
@@ -217,13 +203,15 @@ if st.sidebar.button("启动数据推流", use_container_width=True):
             pred_class = pred_class_prev
             cam_data = []
 
-        # ---- 预警诊断 ----
+        # ---- 预警诊断 (未来倾向) + 当前节律 ----
         diag_info = INFERENCE_MAP.get(pred_class, INFERENCE_MAP[0])
+        cur_name = CLASS_NAMES[cur_class] if 0 <= cur_class < len(CLASS_NAMES) else "—"
         diag_placeholder.markdown(
             f"<div style='background:#1E1E28;padding:20px 28px;border-radius:10px;"
             f"border-left:10px solid {diag_info['color']};box-shadow:0 4px 12px rgba(0,0,0,0.3);'>"
             f"<h1 style='margin:0;color:{diag_info['color']};font-size:26px;font-weight:700;'>{diag_info['title']}</h1>"
-            f"<p style='margin:6px 0 0;color:#94A3B8;font-size:14px;'>未来 5 分钟预警</p></div>",
+            f"<p style='margin:6px 0 0;color:#94A3B8;font-size:14px;'>未来 2~5 分钟状态倾向预警 ｜ "
+            f"当前节律：<span style='color:#CBD5E1;'>{cur_name}</span></p></div>",
             unsafe_allow_html=True
         )
 
@@ -291,7 +279,8 @@ if st.sidebar.button("启动数据推流", use_container_width=True):
         if st.session_state.anomaly_logs:
             lines = []
             for e in reversed(st.session_state.anomaly_logs):
-                c = CLASS_COLORS.get(e.get("class", 0), "#94A3B8")
+                idx = e.get("class", 0)
+                c = CLASS_COLORS[idx] if 0 <= idx < len(CLASS_COLORS) else "#94A3B8"
                 lines.append(
                     f"<div style='padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.05);"
                     f"font-size:12px;color:#94A3B8;'>"
