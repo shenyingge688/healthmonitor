@@ -1,23 +1,57 @@
-# ºöÂÔ Python »º´æÓëÔËĞĞ»·¾³
+ï»¿# Python cache and local runtime
 __pycache__/
 *.pyc
 venv/
 .env
 
-# ºöÂÔÊı¾İ¼¯ºÍÔ­Ê¼ MIT-BIH ĞÄµçÊı¾İ
+# ECG datasets and raw MIT-BIH files
 dataset/
 data/mitdb/
+data/ltafdb_pilot/
 *.pt
 *.dat
 *.hea
 *.atr
 
-# ºöÂÔÄ£ĞÍ×î¼ÑÈ¨ÖØ´æµµ
+# Model weights and training logs
 models/
 *.pth
 *.h5
+logs/
+models_v7_stage1/
 
-# ºöÂÔÏµÍ³¼¶Òş²ØÎÄ¼ş
-.DS_Storegit --version
-
+# Local IDE/system/temp files
+.DS_Store
 .vs/
+~$*
+*_temp.py
+
+# Large experiment outputs / archives
+results/
+results_v7_round5/
+archive_experiments/
+archive_legacy_root/
+cleanup_candidates/
+final_artifacts/
+conversation-f3d00ba6/
+history/
+healthmonitor-3.0/
+
+# Current core workspace runtime artifacts
+current_core_v7/data/
+current_core_v7/dataset/
+current_core_v7/dataset_v7/
+current_core_v7/dataset_v7_h180/
+current_core_v7/models/
+current_core_v7/models_v7_stage1/
+current_core_v7/models_v7_round*/
+current_core_v7/logs/
+current_core_v7/results/
+current_core_v7/results_current/
+current_core_v7/results_v7_round*/
+current_core_v7/__pycache__/
+
+# Office docs and local notes
+AGENTS.md
+*.docx
+æŒ‡ä»¤.txt

@@ -294,6 +294,28 @@ def init_buffer():
     return {'X': [], 'X_rr': [], 'Y_cur': [], 'Y_fut': [], 'T_weight': []}
 
 
+def set_predict_sec(predict_sec):
+    global PREDICT_SEC
+    PREDICT_SEC = int(predict_sec)
+
+
+def write_dataset_config(output_dir):
+    config = {
+        "target_fs": int(TARGET_FS),
+        "history_sec": int(HISTORY_SEC),
+        "predict_sec": int(PREDICT_SEC),
+        "window_sec": int(WINDOW_SEC),
+        "overlap_stride_sec": int(OVERLAP_STRIDE_SEC),
+        "n_windows": int(N_WINDOWS),
+        "fixed_stride_sec": int(FIXED_STRIDE_SEC),
+        "db_stride_override": DB_STRIDE_OVERRIDE,
+        "class_order": ["Normal", "PVC", "AFib", "VF", "VT", "AT/SVT"],
+    }
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, "dataset_config.json"), "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2)
+
+
 def save_shard(buffer, shard_idx, split_name):
     path = os.path.join(SAVE_DIR, f'{split_name}_shard_{shard_idx:03d}.pt')
     torch.save({
@@ -446,16 +468,22 @@ def records_from_plan(split_plan, split_name):
     return records
 
 
-def build_from_split_plan(plan_path, output_dir, splits, shard_size=None, max_records_per_split=None):
-    global SAVE_DIR, SHARD_SIZE
+def build_from_split_plan(plan_path, output_dir, splits, shard_size=None,
+                          max_records_per_split=None, predict_sec=None):
+    global SAVE_DIR, SHARD_SIZE, PREDICT_SEC
     with open(plan_path, "r", encoding="utf-8") as f:
         split_plan = json.load(f)
     old_save_dir = SAVE_DIR
     old_shard_size = SHARD_SIZE
+    old_predict_sec = PREDICT_SEC
     SAVE_DIR = output_dir
     if shard_size is not None:
         SHARD_SIZE = int(shard_size)
+    if predict_sec is not None:
+        set_predict_sec(predict_sec)
     os.makedirs(SAVE_DIR, exist_ok=True)
+    write_dataset_config(SAVE_DIR)
+    print(f"[config] HISTORY_SEC={HISTORY_SEC} PREDICT_SEC={PREDICT_SEC}")
     try:
         for split in splits:
             recs = records_from_plan(split_plan, split)
@@ -474,6 +502,7 @@ def build_from_split_plan(plan_path, output_dir, splits, shard_size=None, max_re
     finally:
         SAVE_DIR = old_save_dir
         SHARD_SIZE = old_shard_size
+        PREDICT_SEC = old_predict_sec
 
 
 # =========================================================
@@ -492,6 +521,8 @@ if __name__ == '__main__':
                     help="Override shard size for planned builds; useful for smoke tests")
     ap.add_argument("--max-records-per-split", type=int, default=None,
                     help="Build only the first N records from each split plan for smoke tests")
+    ap.add_argument("--predict-sec", type=int, default=None,
+                    help="Override future-label horizon in seconds; default keeps existing 300s V7 behavior")
     args = ap.parse_args()
 
     if args.split_plan:
@@ -501,6 +532,7 @@ if __name__ == '__main__':
             args.splits,
             shard_size=args.shard_size,
             max_records_per_split=args.max_records_per_split,
+            predict_sec=args.predict_sec,
         )
         raise SystemExit(0)
 

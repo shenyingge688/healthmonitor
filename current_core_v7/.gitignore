@@ -1,0 +1,35 @@
+﻿# Python cache and local runtime
+__pycache__/
+*.pyc
+venv/
+.env
+
+# ECG datasets and raw MIT-BIH files
+data/
+dataset/
+dataset_v7/
+dataset_v7_h180/
+*.pt
+*.dat
+*.hea
+*.atr
+
+# Model weights and training logs
+models/
+models_v7_stage1/
+models_v7_round*/
+*.pth
+*.h5
+logs/
+
+# Results and runtime outputs
+results/
+results_current/
+results_v7_round*/
+
+# Local IDE/system/temp files
+.DS_Store
+.vs/
+~$*
+*_temp.py
+AGENTS.md

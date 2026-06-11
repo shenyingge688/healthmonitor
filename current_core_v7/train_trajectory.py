@@ -78,12 +78,74 @@ def compute_class_weights(y_curs):
     return torch.tensor(w, dtype=torch.float32, device=device)
 
 
-def build_sampler_weights(y_curs, t_ws):
+def compute_future_class_weights(y_futs):
+    """Inverse-sqrt-frequency class weights from soft future label mass."""
+    mass = np.asarray(y_futs, dtype=np.float64).sum(axis=0)
+    n_total = mass.sum()
+    w = np.sqrt(n_total / (NUM_CLASSES * np.maximum(mass, 1.0)))
+    w = np.clip(w, 0.5, 8.0)
+    return torch.tensor(w, dtype=torch.float32, device=device), mass
+
+
+def build_sampler_weights(y_curs, t_ws, y_futs=None, sampler_mode="current"):
     """Per-sample sampling weight = inverse-sqrt class freq * transition weight."""
     counts = np.bincount(y_curs, minlength=NUM_CLASSES).astype(np.float64)
     inv = 1.0 / np.sqrt(np.maximum(counts, 1.0))
     sw = inv[y_curs] * np.maximum(t_ws, 1.0)
+    if sampler_mode == "current":
+        pass
+    elif sampler_mode == "future_event":
+        if y_futs is None:
+            raise ValueError("future_event sampler requires y_futs")
+        y_futs = np.asarray(y_futs, dtype=np.float64)
+        fut_major = y_futs.argmax(axis=1)
+        fut_counts = np.bincount(fut_major, minlength=NUM_CLASSES).astype(np.float64)
+        fut_inv = 1.0 / np.sqrt(np.maximum(fut_counts, 1.0))
+        fut_inv = fut_inv / max(fut_inv[0], 1e-12)
+        arr_mass = np.clip(y_futs[:, 1:].sum(axis=1), 0.0, 1.0)
+        high_mass = np.clip(y_futs[:, [3, 4]].sum(axis=1), 0.0, 1.0)
+        transition_boost = np.sqrt(np.maximum(t_ws, 1.0))
+        event_boost = 1.0 + 0.75 * arr_mass + 1.0 * high_mass
+        sw = sw * np.clip(fut_inv[fut_major], 0.75, 2.0) * event_boost * transition_boost
+    else:
+        raise ValueError(f"unsupported sampler_mode: {sampler_mode}")
+    sw = sw / max(float(np.mean(sw)), 1e-12)
+    sw = np.clip(sw, 0.10, 12.0)
     return torch.tensor(sw, dtype=torch.double)
+
+
+def summarize_sampler_weights(weights, y_curs, y_futs, t_ws, sampler_mode):
+    w = np.asarray(weights, dtype=np.float64)
+    y_futs = np.asarray(y_futs, dtype=np.float64)
+    arr = y_futs[:, 1:].sum(axis=1) > 0.01
+    high = y_futs[:, [3, 4]].sum(axis=1) > 0.01
+    trans = np.asarray(t_ws) > 1.0
+    rows = {
+        "mode": sampler_mode,
+        "mean": float(w.mean()),
+        "p50": float(np.percentile(w, 50)),
+        "p95": float(np.percentile(w, 95)),
+        "p99": float(np.percentile(w, 99)),
+        "max": float(w.max()),
+        "arrhythmia_mean": float(w[arr].mean()) if arr.any() else 0.0,
+        "normal_future_mean": float(w[~arr].mean()) if (~arr).any() else 0.0,
+        "high_risk_mean": float(w[high].mean()) if high.any() else 0.0,
+        "transition_mean": float(w[trans].mean()) if trans.any() else 0.0,
+    }
+    print(f"Sampler mode: {sampler_mode}")
+    print(
+        "Sampler weights: "
+        f"mean={rows['mean']:.3f} p50={rows['p50']:.3f} "
+        f"p95={rows['p95']:.3f} p99={rows['p99']:.3f} max={rows['max']:.3f}"
+    )
+    print(
+        "Sampler groups: "
+        f"future_arr={rows['arrhythmia_mean']:.3f} "
+        f"future_normal={rows['normal_future_mean']:.3f} "
+        f"future_high={rows['high_risk_mean']:.3f} "
+        f"transition={rows['transition_mean']:.3f}"
+    )
+    return rows
 
 
 def binary_pos_weight(soft_targets, max_weight=20.0):
@@ -142,7 +204,8 @@ def lr_schedule(step, warmup=800, total=20000):
 SMOOTH = 0.06
 
 
-def v6_loss(logits_cur, logits_fut, y_cur, y_fut, t_weight, class_w,
+def v6_loss(logits_cur, logits_fut, y_cur, y_fut, t_weight, class_w_cur,
+            class_w_fut=None,
             risk_loss_weight=0.0, arr_pos_weight=None, high_pos_weight=None,
             risk_high_weight=1.5):
     """
@@ -150,19 +213,20 @@ def v6_loss(logits_cur, logits_fut, y_cur, y_fut, t_weight, class_w,
       - Future head:  class-weighted soft cross-entropy on the future distribution
       - Transition weight scales the FUTURE term only
     """
-    cw = class_w.view(1, -1)
+    cw_cur = class_w_cur.view(1, -1)
+    cw_fut = (class_w_fut if class_w_fut is not None else class_w_cur).view(1, -1)
 
     # Current head: class-weighted focal CE
     y_cur_oh = F.one_hot(y_cur, NUM_CLASSES).float()
     y_cur_sm = y_cur_oh * (1.0 - SMOOTH) + SMOOTH / NUM_CLASSES
     log_probs_cur = F.log_softmax(logits_cur.float(), dim=-1)
-    ce_cur = -(cw * y_cur_sm * log_probs_cur).sum(dim=-1)
+    ce_cur = -(cw_cur * y_cur_sm * log_probs_cur).sum(dim=-1)
     pt = torch.exp(-torch.clamp(ce_cur, max=20.0))
     loss_cur = ((1 - pt) ** 2.0) * ce_cur
 
     # Future head: class-weighted soft cross-entropy
     log_probs_fut = F.log_softmax(logits_fut.float(), dim=-1)
-    loss_fut = -(cw * y_fut.float() * log_probs_fut).sum(dim=-1)
+    loss_fut = -(cw_fut * y_fut.float() * log_probs_fut).sum(dim=-1)
 
     # Transition weight on the future term only
     loss = (loss_cur + 0.8 * t_weight.float() * loss_fut).mean()
@@ -194,7 +258,7 @@ def v6_loss(logits_cur, logits_fut, y_cur, y_fut, t_weight, class_w,
 # =========================================================
 
 def train_epoch(epoch, total_epochs, model, ema, loader, opt, sched, scaler, step_ctr,
-                class_w, risk_cfg=None):
+                class_w_cur, class_w_fut=None, risk_cfg=None):
     model.train()
     model.window_encoder.eval()   # keep frozen BN stats fixed
     total_l, n = 0.0, 0
@@ -216,7 +280,8 @@ def train_epoch(epoch, total_epochs, model, ema, loader, opt, sched, scaler, ste
         with torch.amp.autocast("cuda" if device.type == "cuda" else "cpu"):
             out = model(bx, x_rr=bx_rr)
             loss, lc, lf = v6_loss(
-                out["logits_cur"], out["logits_fut"], y_cur, y_fut, t_w, class_w,
+                out["logits_cur"], out["logits_fut"], y_cur, y_fut, t_w,
+                class_w_cur, class_w_fut,
                 **(risk_cfg or {}),
             )
 
@@ -242,7 +307,7 @@ def train_epoch(epoch, total_epochs, model, ema, loader, opt, sched, scaler, ste
 
 
 @torch.inference_mode()
-def validate(model, loader, class_w, risk_cfg=None):
+def validate(model, loader, class_w_cur, class_w_fut=None, risk_cfg=None):
     model.eval()
     tl, n = 0.0, 0
     ap_cur, at_cur, ap_fut, at_fut, prob_fut = [], [], [], [], []
@@ -259,7 +324,8 @@ def validate(model, loader, class_w, risk_cfg=None):
         with torch.amp.autocast("cuda" if device.type == "cuda" else "cpu"):
             out = model(bx, x_rr=bx_rr)
             loss, _, _ = v6_loss(
-                out["logits_cur"], out["logits_fut"], y_cur, y_fut, t_w, class_w,
+                out["logits_cur"], out["logits_fut"], y_cur, y_fut, t_w,
+                class_w_cur, class_w_fut,
                 **(risk_cfg or {}),
             )
         tl += loss.item(); n += 1
@@ -335,7 +401,8 @@ def validate(model, loader, class_w, risk_cfg=None):
             "transition_n": int(trans.sum())}
 
 
-def save_checkpoint(path, model, ema, epoch, score_name, score_value, metrics, class_w):
+def save_checkpoint(path, model, ema, epoch, score_name, score_value, metrics,
+                    class_w_cur, class_w_fut=None):
     torch.save({
         "model": model.state_dict(),
         "ema": ema.shadow.state_dict(),
@@ -343,11 +410,13 @@ def save_checkpoint(path, model, ema, epoch, score_name, score_value, metrics, c
         "score_name": score_name,
         "score_value": float(score_value),
         "metrics": metrics,
-        "class_weights": class_w.cpu(),
+        "class_weights": class_w_cur.cpu(),
+        "class_weights_current": class_w_cur.cpu(),
+        "class_weights_future": (class_w_fut if class_w_fut is not None else class_w_cur).cpu(),
     }, path)
 
 
-def update_metric_checkpoints(trackers, model, ema, epoch, metrics, class_w):
+def update_metric_checkpoints(trackers, model, ema, epoch, metrics, class_w_cur, class_w_fut=None):
     saved = []
     for name, cfg in trackers.items():
         value = cfg["value_fn"](metrics)
@@ -355,7 +424,8 @@ def update_metric_checkpoints(trackers, model, ema, epoch, metrics, class_w):
         if improved:
             cfg["best"] = float(value)
             cfg["epoch"] = epoch
-            save_checkpoint(cfg["path"], model, ema, epoch, name, value, metrics, class_w)
+            save_checkpoint(cfg["path"], model, ema, epoch, name, value, metrics,
+                            class_w_cur, class_w_fut)
             saved.append((name, value, cfg["path"]))
     return saved
 
@@ -377,7 +447,8 @@ def append_history(path, epoch, train_loss, score, metrics):
 
 def main(seed=None, dataset_dir="dataset", output_root="models", epochs=60, batch_size=24,
          backbone_path="models/ptbxl_backbone.pth", risk_loss_weight=0.0,
-         risk_high_weight=1.5, selection_mode="v6"):
+         risk_high_weight=1.5, selection_mode="v6", future_weight_mode="cur",
+         encoder_tune="frozen", encoder_tail_lr=1e-4, sampler_mode="current"):
     print("=" * 60)
     print(f"V6.1 Minority-Aware Dual-Head Training | Device = {device}")
     if seed is not None:
@@ -402,10 +473,18 @@ def main(seed=None, dataset_dir="dataset", output_root="models", epochs=60, batc
 
     # Class weights + sampler from train labels
     y_curs, y_futs, t_ws = collect_labels(train_ds)
-    class_w = compute_class_weights(y_curs)
+    class_w_cur = compute_class_weights(y_curs)
+    class_w_fut = class_w_cur
     counts = np.bincount(y_curs, minlength=NUM_CLASSES)
     print(f"Train Y_cur counts: {dict(zip(CLASS_NAMES, counts.tolist()))}")
-    print(f"Class weights: {[round(float(x),2) for x in class_w.tolist()]}")
+    print(f"Current-head class weights: {[round(float(x),2) for x in class_w_cur.tolist()]}")
+    if future_weight_mode == "soft":
+        class_w_fut, fut_mass = compute_future_class_weights(y_futs)
+        fut_mass_print = [round(float(x), 2) for x in fut_mass.tolist()]
+        print(f"Train Y_fut soft mass: {dict(zip(CLASS_NAMES, fut_mass_print))}")
+    elif future_weight_mode != "cur":
+        raise ValueError(f"unsupported future_weight_mode: {future_weight_mode}")
+    print(f"Future-head class weights ({future_weight_mode}): {[round(float(x),2) for x in class_w_fut.tolist()]}")
     arr_pos_w = binary_pos_weight(y_futs[:, 1:].sum(axis=1))
     high_pos_w = binary_pos_weight(y_futs[:, [3, 4]].sum(axis=1))
     risk_cfg = None
@@ -421,8 +500,13 @@ def main(seed=None, dataset_dir="dataset", output_root="models", epochs=60, batc
             f"high_weight={risk_high_weight} arr_pos_w={arr_pos_w:.2f} high_pos_w={high_pos_w:.2f}"
         )
     print(f"Selection mode: {selection_mode}")
-    sampler = WeightedRandomSampler(build_sampler_weights(y_curs, t_ws),
-                                    num_samples=len(train_ds), replacement=True)
+    sampler_w = build_sampler_weights(
+        y_curs, t_ws, y_futs=y_futs, sampler_mode=sampler_mode
+    )
+    sampler_summary = summarize_sampler_weights(
+        sampler_w.numpy(), y_curs, y_futs, t_ws, sampler_mode=sampler_mode
+    )
+    sampler = WeightedRandomSampler(sampler_w, num_samples=len(train_ds), replacement=True)
 
     tl = DataLoader(train_ds, batch_size=B, sampler=sampler, num_workers=0,
                     pin_memory=True, drop_last=True)
@@ -435,7 +519,14 @@ def main(seed=None, dataset_dir="dataset", output_root="models", epochs=60, batc
         bb = torch.load(backbone_path, map_location=device, weights_only=True)
         model.window_encoder.load_state_dict(bb, strict=False)
         print("  Loaded.")
-    model.freeze_encoder()
+    if encoder_tune == "tail":
+        model.unfreeze_encoder_tail()
+        print(f"Encoder tuning: tail (stage4 + pool_proj), lr={encoder_tail_lr:g}")
+    elif encoder_tune == "frozen":
+        model.freeze_encoder()
+        print("Encoder tuning: frozen")
+    else:
+        raise ValueError(f"unsupported encoder_tune: {encoder_tune}")
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"Params: {trainable:,} trainable / {total:,} total")
@@ -445,8 +536,25 @@ def main(seed=None, dataset_dir="dataset", output_root="models", epochs=60, batc
     step_ctr = [0]
     os.makedirs(output_root, exist_ok=True)
 
-    trainable_p = [p for p in model.parameters() if p.requires_grad]
-    opt = torch.optim.AdamW(trainable_p, lr=5e-4, weight_decay=3e-4)
+    if encoder_tune == "tail":
+        encoder_param_ids = {
+            id(p)
+            for module in (model.window_encoder.stage4, model.window_encoder.pool_proj)
+            for p in module.parameters()
+            if p.requires_grad
+        }
+        encoder_params = [p for p in model.parameters() if p.requires_grad and id(p) in encoder_param_ids]
+        other_params = [p for p in model.parameters() if p.requires_grad and id(p) not in encoder_param_ids]
+        opt = torch.optim.AdamW(
+            [
+                {"params": other_params, "lr": 5e-4},
+                {"params": encoder_params, "lr": float(encoder_tail_lr)},
+            ],
+            weight_decay=3e-4,
+        )
+    else:
+        trainable_p = [p for p in model.parameters() if p.requires_grad]
+        opt = torch.optim.AdamW(trainable_p, lr=5e-4, weight_decay=3e-4)
     total_steps = len(tl) * EPOCHS
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: lr_schedule(s, warmup=600, total=total_steps))
 
@@ -495,8 +603,11 @@ def main(seed=None, dataset_dir="dataset", output_root="models", epochs=60, batc
 
     for ep in range(1, EPOCHS + 1):
         t0 = time.time()
-        tr_loss = train_epoch(ep, EPOCHS, model, ema, tl, opt, sched, scaler, step_ctr, class_w, risk_cfg=risk_cfg)
-        vm = validate(ema.shadow, vl, class_w, risk_cfg=risk_cfg)
+        tr_loss = train_epoch(
+            ep, EPOCHS, model, ema, tl, opt, sched, scaler, step_ctr,
+            class_w_cur, class_w_fut, risk_cfg=risk_cfg,
+        )
+        vm = validate(ema.shadow, vl, class_w_cur, class_w_fut, risk_cfg=risk_cfg)
         dt = time.time() - t0
 
         # Minority-aware selection (NO Normal-accuracy reward)
@@ -530,7 +641,7 @@ def main(seed=None, dataset_dir="dataset", output_root="models", epochs=60, batc
         else:
             no_imp += 1
 
-        saved = update_metric_checkpoints(trackers, model, ema, ep, vm, class_w)
+        saved = update_metric_checkpoints(trackers, model, ema, ep, vm, class_w_cur, class_w_fut)
         if saved:
             for name, value, path in saved:
                 print(f"  [save:{name}] {value:.4f} -> {path}")
@@ -549,7 +660,10 @@ def main(seed=None, dataset_dir="dataset", output_root="models", epochs=60, batc
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    save_checkpoint(f"{out_dir}/arrhythmia_warning_final.pth", model, ema, ep, "final_epoch", score, vm, class_w)
+    save_checkpoint(
+        f"{out_dir}/arrhythmia_warning_final.pth", model, ema, ep, "final_epoch",
+        score, vm, class_w_cur, class_w_fut,
+    )
     print(f"\nDone. composite best={best_score:.4f} @ ep {best_ep} -> {save_p}")
     print("Checkpoint summary:")
     for name, cfg in trackers.items():
@@ -580,6 +694,11 @@ def main(seed=None, dataset_dir="dataset", output_root="models", epochs=60, batc
         "risk_loss_weight": risk_loss_weight,
         "risk_high_weight": risk_high_weight,
         "selection_mode": selection_mode,
+        "future_weight_mode": future_weight_mode,
+        "encoder_tune": encoder_tune,
+        "encoder_tail_lr": encoder_tail_lr,
+        "sampler_mode": sampler_mode,
+        "sampler_summary": sampler_summary,
         "history_csv": history_p,
     }
     with open(f"{out_dir}/summary.json", "w", encoding="utf-8") as f:
@@ -598,8 +717,14 @@ if __name__ == "__main__":
     ap.add_argument("--risk-loss-weight", type=float, default=0.0)
     ap.add_argument("--risk-high-weight", type=float, default=1.5)
     ap.add_argument("--selection-mode", choices=["v6", "risk_aware"], default="v6")
+    ap.add_argument("--future-weight-mode", choices=["cur", "soft"], default="cur")
+    ap.add_argument("--encoder-tune", choices=["frozen", "tail"], default="frozen")
+    ap.add_argument("--encoder-tail-lr", type=float, default=1e-4)
+    ap.add_argument("--sampler-mode", choices=["current", "future_event"], default="current")
     args = ap.parse_args()
     main(seed=args.seed, dataset_dir=args.dataset_dir, output_root=args.output_root,
          epochs=args.epochs, batch_size=args.batch_size, backbone_path=args.backbone,
          risk_loss_weight=args.risk_loss_weight, risk_high_weight=args.risk_high_weight,
-         selection_mode=args.selection_mode)
+         selection_mode=args.selection_mode, future_weight_mode=args.future_weight_mode,
+         encoder_tune=args.encoder_tune, encoder_tail_lr=args.encoder_tail_lr,
+         sampler_mode=args.sampler_mode)

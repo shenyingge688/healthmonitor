@@ -53,7 +53,7 @@ start_mins = st.sidebar.slider(
 )
 st.sidebar.caption("起始点前的历史用于建立基线参考（模型回溯过去 10 分钟）。上限 16 分钟（需预留缓冲）。")
 
-if st.sidebar.button("清空追踪日志", use_container_width=True):
+if st.sidebar.button("清空追踪日志", width="stretch"):
     st.session_state.anomaly_logs = []
     st.rerun()
 
@@ -146,7 +146,7 @@ def bar_html(label, prob, color):
 # Simulation Loop
 # =========================================================
 
-if st.sidebar.button("启动数据推流", use_container_width=True):
+if st.sidebar.button("启动数据推流", width="stretch"):
     sim_step = 0
     base_offset_pts = int(start_mins * 60 * 250)
     ecg_buffer = np.full(1000, np.nan)
@@ -155,6 +155,14 @@ if st.sidebar.button("启动数据推流", use_container_width=True):
     prob_history = deque(maxlen=60)      # 60 帧概率历史 (~60s), 环形缓冲
     pred_class_prev = 0
     cur_class = 0
+    uncertainty_info = {
+        "confidence": "unknown",
+        "risk_score": 0.0,
+        "risk_mean": 0.0,
+        "risk_std": 0.0,
+        "vote_count": 0,
+        "ensemble_size": 3,
+    }
 
     while True:
         current_pts = base_offset_pts + (sim_step * step_size)
@@ -200,6 +208,14 @@ if st.sidebar.button("启动数据推流", use_container_width=True):
                 cur_class = d.get("current_class", pred_class)  # current rhythm
                 probs = d["probabilities"]
                 cam_data = d.get("cam", [])
+                uncertainty_info = {
+                    "confidence": d.get("confidence", "unknown"),
+                    "risk_score": float(d.get("risk_score", 1.0 - probs[0])),
+                    "risk_mean": float(d.get("risk_mean", 1.0 - probs[0])),
+                    "risk_std": float(d.get("risk_std", 0.0)),
+                    "vote_count": int(d.get("future_vote_count", 0)),
+                    "ensemble_size": int(d.get("ensemble_size", 1)),
+                }
                 prob_history.append(probs)
             except Exception:
                 pred_class = pred_class_prev
@@ -226,8 +242,36 @@ if st.sidebar.button("启动数据推流", use_container_width=True):
             bars = ""
             for i, name in enumerate(CLASS_NAMES):
                 bars += bar_html(name, probs_now[i], CLASS_COLORS[i])
+            confidence_key = uncertainty_info["confidence"]
+            confidence_label = {
+                "high": "高",
+                "medium": "中",
+                "low": "低",
+            }.get(confidence_key, "未知")
+            confidence_color = {
+                "high": "#10B981",
+                "medium": "#F59E0B",
+                "low": "#EF4444",
+            }.get(confidence_key, "#94A3B8")
+            uncertainty_html = (
+                "<div style='display:grid;grid-template-columns:repeat(4,1fr);gap:8px;"
+                "margin-bottom:12px;font-size:12px;'>"
+                f"<div><span style='color:#94A3B8;'>正式集成风险</span><br>"
+                f"<b style='color:#E2E8F0;'>{uncertainty_info['risk_score']:.1%}</b></div>"
+                f"<div><span style='color:#94A3B8;'>成员风险均值</span><br>"
+                f"<b style='color:#E2E8F0;'>{uncertainty_info['risk_mean']:.1%}</b></div>"
+                f"<div><span style='color:#94A3B8;'>模型分歧 σ</span><br>"
+                f"<b style='color:#E2E8F0;'>{uncertainty_info['risk_std']:.3f}</b></div>"
+                f"<div><span style='color:#94A3B8;'>置信等级</span><br>"
+                f"<b style='color:{confidence_color};'>{confidence_label} "
+                f"({uncertainty_info['vote_count']}/{uncertainty_info['ensemble_size']})</b></div>"
+                "</div>"
+                "<div style='color:#64748B;font-size:10px;margin-bottom:10px;'>"
+                "置信等级仅表示三个模型的一致程度，不代表临床诊断置信区间。</div>"
+            )
             class_placeholder.markdown(
-                f"<div style='background:#1E1E28;padding:12px 16px;border-radius:6px;'>{bars}</div>",
+                f"<div style='background:#1E1E28;padding:12px 16px;border-radius:6px;'>"
+                f"{uncertainty_html}{bars}</div>",
                 unsafe_allow_html=True
             )
 
@@ -304,4 +348,4 @@ if st.sidebar.button("启动数据推流", use_container_width=True):
         time.sleep(refresh_rate)
 else:
     diag_placeholder.info("请选择病例并点击【启动数据推流】开始推演。")
-    chart_placeholder.line_chart(np.full(1000, 0.0), height=200, use_container_width=True)
+    chart_placeholder.line_chart(np.full(1000, 0.0), height=200, width="stretch")
