@@ -446,7 +446,7 @@ def append_history(path, epoch, train_loss, score, metrics):
 
 
 def main(seed=None, dataset_dir="dataset", output_root="models", epochs=60, batch_size=24,
-         backbone_path="models/ptbxl_backbone.pth", risk_loss_weight=0.0,
+         backbone_path="models/pretrained/ptbxl_backbone.pth", risk_loss_weight=0.0,
          risk_high_weight=1.5, selection_mode="v6", future_weight_mode="cur",
          encoder_tune="frozen", encoder_tail_lr=1e-4, sampler_mode="current"):
     print("=" * 60)
@@ -713,7 +713,7 @@ if __name__ == "__main__":
     ap.add_argument("--output-root", default="models", help="root directory for checkpoints and summaries")
     ap.add_argument("--epochs", type=int, default=60)
     ap.add_argument("--batch-size", type=int, default=24)
-    ap.add_argument("--backbone", default="models/ptbxl_backbone.pth")
+    ap.add_argument("--backbone", default="models/pretrained/ptbxl_backbone.pth")
     ap.add_argument("--risk-loss-weight", type=float, default=0.0)
     ap.add_argument("--risk-high-weight", type=float, default=1.5)
     ap.add_argument("--selection-mode", choices=["v6", "risk_aware"], default="v6")

@@ -1,0 +1,100 @@
+{
+  "seed": 1,
+  "epochs_run": 20,
+  "final_epoch": {
+    "loss": 6.408315539360046,
+    "acc_cur": 0.569926873857404,
+    "f1_cur": 0.2388360228430805,
+    "acc_fut": 0.6412248628884827,
+    "f1_fut": 0.23872358639812166,
+    "recall_rare": 0.19581652246408696,
+    "auroc_fut": 0.7300552205168459,
+    "ece_fut": 0.1647571703143268,
+    "arrhythmia_auroc": 0.7076044059106016,
+    "arrhythmia_ap": 0.6963619333308788,
+    "high_risk_auroc": 0.65314790471638,
+    "high_risk_ap": 0.09975215839537131,
+    "transition_acc": 0.7179023508137432,
+    "transition_recall": 0.21706776868433134,
+    "transition_n": 553,
+    "composite_score": 0.3284422313685472,
+    "epoch": 20
+  },
+  "best_composite_epoch": {
+    "loss": 4.293566358478173,
+    "acc_cur": 0.5105118829981719,
+    "f1_cur": 0.284791753141738,
+    "acc_fut": 0.5827239488117002,
+    "f1_fut": 0.29907301096541733,
+    "recall_rare": 0.3369194629939616,
+    "auroc_fut": 0.7330792702856155,
+    "ece_fut": 0.16799208595395304,
+    "arrhythmia_auroc": 0.689301923991881,
+    "arrhythmia_ap": 0.657649006863934,
+    "high_risk_auroc": 0.7618656389420012,
+    "high_risk_ap": 0.1215419072957947,
+    "transition_acc": 0.5406871609403255,
+    "transition_recall": 0.2609230126789482,
+    "transition_n": 553,
+    "composite_score": 0.38915917588806204,
+    "epoch": 12
+  },
+  "peaks": {
+    "f1_cur": [
+      0.2897837308133934,
+      7
+    ],
+    "f1_fut": [
+      0.29907301096541733,
+      12
+    ],
+    "auroc_fut": [
+      0.7863793423631013,
+      8
+    ],
+    "recall_rare": [
+      0.3369194629939616,
+      12
+    ],
+    "transition_recall": [
+      0.2609230126789482,
+      12
+    ],
+    "arrhythmia_auroc": [
+      0.7464795843273901,
+      10
+    ],
+    "high_risk_auroc": [
+      0.8059323215423836,
+      5
+    ],
+    "high_risk_ap": [
+      0.25108811458583075,
+      1
+    ],
+    "ece_fut_min": [
+      0.06892940346185643,
+      6
+    ]
+  },
+  "risk_loss_weight": 0.0,
+  "risk_high_weight": 1.5,
+  "selection_mode": "v6",
+  "future_weight_mode": "cur",
+  "encoder_tune": "frozen",
+  "encoder_tail_lr": 0.0001,
+  "sampler_mode": "current",
+  "sampler_summary": {
+    "mode": "current",
+    "mean": 0.9999999999999997,
+    "p50": 0.46168125707458,
+    "p95": 2.4158926123979207,
+    "p99": 8.333954143394497,
+    "max": 10.734269382050117,
+    "arrhythmia_mean": 1.491003219580788,
+    "normal_future_mean": 0.5099026904184377,
+    "high_risk_mean": 4.157979126868851,
+    "transition_mean": 2.7653081971003104
+  },
+  "history_csv": "models_v7_stage1/seeds/seed1/training_history_v6_1_20260610_131907.csv"
+}
