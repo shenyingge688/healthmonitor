@@ -1,0 +1,15 @@
+{
+  "status": "full_external_support",
+  "scope": "full_ltafdb_83_record_fixed_quality_primary_analysis",
+  "official_round5_alarm_changed": false,
+  "external_threshold_tuning_performed": false,
+  "patient_bootstrap_replicates": 1000,
+  "checks": {
+    "candidate_dominant_auroc_at_least_0_65": true,
+    "candidate_event_recall_not_below_baseline": true,
+    "candidate_false_episode_burden_within_20_percent": true,
+    "per_record_median_auroc_at_least_0_60": true
+  },
+  "passed_checks": 4,
+  "total_checks": 4
+}

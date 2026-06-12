@@ -1,0 +1,133 @@
+{
+  "input_csv": "C:\\HealthMonitor\\current_core_v7\\results_v7_round5\\ensemble_seed014_best_val_full\\final_validation_outputs.csv",
+  "rows": 2188,
+  "patient_or_record_units": 21,
+  "selection_split": "validation_only",
+  "thresholds": [
+    0.02,
+    0.03,
+    0.04,
+    0.05,
+    0.06,
+    0.08,
+    0.1,
+    0.12,
+    0.15,
+    0.2,
+    0.25,
+    0.3,
+    0.4,
+    0.5,
+    0.6,
+    0.7,
+    0.8
+  ],
+  "gate": {
+    "positive_records": 5,
+    "event_recall": 0.2,
+    "median_lead_time_sec": 60.0,
+    "false_alert_episodes_per_patient_hour": 1.0
+  },
+  "decisions": {
+    "vt_vs_normal": {
+      "status": "stopped_gate_not_met",
+      "best_event_recall_candidate": {
+        "threshold": 0.02,
+        "smoothing_method": "ewma",
+        "smoothing_alpha": 0.65,
+        "consecutive_k": 2,
+        "positive_records": 7,
+        "future_support": 91,
+        "predicted_positive_windows": 806,
+        "future_precision": 0.0794044665012407,
+        "future_recall": 0.7032967032967034,
+        "events": 12,
+        "detected_events": 8,
+        "event_recall": 0.6666666666666666,
+        "median_lead_time_sec": 215.0,
+        "false_alert_windows": 658,
+        "false_alert_episodes": 33,
+        "patient_hours": 11.574999999999998,
+        "false_alert_episodes_per_patient_hour": 2.850971922246221,
+        "score_name": "vt_vs_normal",
+        "gate_passed": false
+      },
+      "failed_checks": [
+        "false_episodes_at_most_1_per_hour"
+      ],
+      "official_round5_alarm_changed": false
+    },
+    "vf_vs_normal": {
+      "status": "stopped_insufficient_positive_records",
+      "positive_records": 1,
+      "required_positive_records": 5,
+      "official_round5_alarm_changed": false
+    },
+    "vt_vf_vs_normal": {
+      "status": "passed_retraining_gate",
+      "selected_policy": {
+        "threshold": 0.6,
+        "smoothing_method": "raw",
+        "smoothing_alpha": 1.0,
+        "consecutive_k": 2,
+        "positive_records": 8,
+        "future_support": 96,
+        "predicted_positive_windows": 55,
+        "future_precision": 0.38181818181818183,
+        "future_recall": 0.21875,
+        "events": 14,
+        "detected_events": 3,
+        "event_recall": 0.21428571428571427,
+        "median_lead_time_sec": 240.0,
+        "false_alert_windows": 17,
+        "false_alert_episodes": 5,
+        "patient_hours": 11.574999999999998,
+        "false_alert_episodes_per_patient_hour": 0.43196544276457893,
+        "score_name": "vt_vf_vs_normal",
+        "gate_passed": true
+      },
+      "checks": {
+        "positive_records_at_least_5": true,
+        "event_recall_at_least_0_20": true,
+        "median_lead_at_least_60_sec": true,
+        "false_episodes_at_most_1_per_hour": true,
+        "official_round5_alarm_unchanged": true
+      },
+      "official_round5_alarm_changed": false
+    },
+    "tachy_vs_normal": {
+      "status": "passed_retraining_gate",
+      "selected_policy": {
+        "threshold": 0.7,
+        "smoothing_method": "ewma",
+        "smoothing_alpha": 0.65,
+        "consecutive_k": 2,
+        "positive_records": 8,
+        "future_support": 91,
+        "predicted_positive_windows": 63,
+        "future_precision": 0.06349206349206349,
+        "future_recall": 0.04395604395604396,
+        "events": 13,
+        "detected_events": 3,
+        "event_recall": 0.23076923076923078,
+        "median_lead_time_sec": 130.0,
+        "false_alert_windows": 54,
+        "false_alert_episodes": 3,
+        "patient_hours": 11.574999999999998,
+        "false_alert_episodes_per_patient_hour": 0.2591792656587474,
+        "score_name": "tachy_vs_normal",
+        "gate_passed": true
+      },
+      "checks": {
+        "positive_records_at_least_5": true,
+        "event_recall_at_least_0_20": true,
+        "median_lead_at_least_60_sec": true,
+        "false_episodes_at_most_1_per_hour": true,
+        "official_round5_alarm_unchanged": true
+      },
+      "official_round5_alarm_changed": false
+    }
+  },
+  "any_score_passed": true,
+  "official_round5_alarm_changed": false
+}

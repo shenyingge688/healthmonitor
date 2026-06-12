@@ -1,0 +1,38 @@
+{
+  "method": {
+    "level_1": "seed0_seed1_seed4_mean_class_conditional_window_gradcam",
+    "level_2": "selected_window_ensemble_integrated_gradients",
+    "integrated_gradient_steps": 12,
+    "annotation_neighborhood_sec": 0.2,
+    "deployment_note": "offline_or_on_demand_only_due_to_backward_pass_cost"
+  },
+  "cases": [
+    {
+      "record": "mitdb:201",
+      "status": "held_out_demo",
+      "target": "PVC",
+      "target_probability": 0.17744295299053192,
+      "selected_window_index": 38,
+      "selected_window_annotated_beats": 6,
+      "window_cam_annotated_to_background_ratio": 6.969006756852456,
+      "sample_attribution_annotated_to_background_ratio": 1.968133369788212,
+      "beat_neighborhood_average_precision": 0.17837853590784786,
+      "image": "mitdb_201_class1_m11.png",
+      "metrics": "mitdb_201_class1_m11.json"
+    },
+    {
+      "record": "mitdb:119",
+      "status": "demo_case",
+      "target": "PVC",
+      "target_probability": 0.8389232158660889,
+      "selected_window_index": 27,
+      "selected_window_annotated_beats": 5,
+      "window_cam_annotated_to_background_ratio": 2.664022040305287,
+      "sample_attribution_annotated_to_background_ratio": 5.320148033434489,
+      "beat_neighborhood_average_precision": 0.41461560613488946,
+      "image": "mitdb_119_class1_m11.png",
+      "metrics": "mitdb_119_class1_m11.json"
+    }
+  ],
+  "decision": "accepted_as_offline_explanation_artifact"
+}

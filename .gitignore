@@ -37,6 +37,12 @@ conversation-f3d00ba6/
 history/
 healthmonitor-3.0/
 
+# Generated QA/debug intermediates kept out of public branch sync
+artifacts/demo/frontend_debug/
+artifacts/report_text_extract_*.txt
+artifacts/pre_submission_git_status_*.txt
+artifacts_pre_restructure_baseline/
+
 # Current core workspace runtime artifacts
 current_core_v7/data/
 current_core_v7/dataset/

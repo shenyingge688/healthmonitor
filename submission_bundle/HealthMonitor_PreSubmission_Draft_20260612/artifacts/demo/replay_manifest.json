@@ -1,0 +1,155 @@
+{
+  "manifest_version": "competition-demo-v2",
+  "generated_with": {
+    "ensemble": "official three-member logits ensemble",
+    "policy": {
+      "score": "1-P(Normal)",
+      "ewma_alpha": 0.65,
+      "threshold": 0.1,
+      "consecutive_k": 2,
+      "inference_interval_sec": 10.0,
+      "version": "overall-risk-v1"
+    },
+    "inference_interval_sec": 10,
+    "serving_batch_size": 1
+  },
+  "cases": {
+    "100": {
+      "record_id": "100",
+      "db": "mitdb",
+      "split": "demo_holdout",
+      "tier": "formal_success",
+      "title": "正常基线与误报抑制",
+      "short_title": "MIT-BIH 100 · 正常基线",
+      "start_min": 10.0,
+      "end_min": 13.0,
+      "target_class": 0,
+      "claim": "所选冻结片段用于展示正常基线和正式报警的误报抑制。",
+      "boundary": "仅代表该冻结片段，不外推为所有正常心电均不报警。",
+      "replay_file": "mitdb_100.json",
+      "summary": {
+        "points": 19,
+        "official_alarm_points": 0,
+        "current_target_argmax_points": 19,
+        "future_target_argmax_points": 19,
+        "max_target_probability_cur": 0.5387755632400513,
+        "max_target_probability_fut": 0.9881651401519775,
+        "max_afib_direction_score": 0.02039729245007038,
+        "rhythm_annotation_count": 0
+      }
+    },
+    "119": {
+      "record_id": "119",
+      "db": "mitdb",
+      "split": "demo_holdout",
+      "tier": "formal_success",
+      "title": "PVC稳定识别与模型关注窗口",
+      "short_title": "MIT-BIH 119 · PVC",
+      "start_min": 10.0,
+      "end_min": 13.0,
+      "target_class": 1,
+      "claim": "所选冻结片段用于展示PVC输出及模型关注窗口与室性标注的对应关系。",
+      "boundary": "类别输出是模型参考，不替代临床节律判读。",
+      "replay_file": "mitdb_119.json",
+      "summary": {
+        "points": 19,
+        "official_alarm_points": 18,
+        "current_target_argmax_points": 19,
+        "future_target_argmax_points": 19,
+        "max_target_probability_cur": 0.836388111114502,
+        "max_target_probability_fut": 0.8771769404411316,
+        "max_afib_direction_score": 0.25631973147392273,
+        "rhythm_annotation_count": 7
+      }
+    },
+    "201": {
+      "record_id": "201",
+      "db": "mitdb",
+      "split": "demo_holdout",
+      "tier": "pilot_success",
+      "title": "AFib辅助方向提示",
+      "short_title": "MIT-BIH 201 · AFib辅助方向",
+      "start_min": 26.5,
+      "end_min": 29.5,
+      "target_class": 2,
+      "claim": "26.5至29.5分钟覆盖AFib标注起始后的片段，用于展示AFib辅助方向分数。",
+      "boundary": "LTAFDB 83记录主分析、84记录敏感性分析的外部研究支持；尚未接入正式报警。",
+      "replay_file": "mitdb_201.json",
+      "summary": {
+        "points": 19,
+        "official_alarm_points": 18,
+        "current_target_argmax_points": 10,
+        "future_target_argmax_points": 18,
+        "max_target_probability_cur": 0.6178978681564331,
+        "max_target_probability_fut": 0.687556803226471,
+        "max_afib_direction_score": 0.9372299909591675,
+        "rhythm_annotation_count": 1
+      }
+    },
+    "223": {
+      "record_id": "223",
+      "db": "mitdb",
+      "split": "demo_holdout",
+      "tier": "boundary",
+      "title": "短阵VT未稳定检出",
+      "short_title": "MIT-BIH 223 · VT能力边界",
+      "start_min": 9.3,
+      "end_min": 10.8,
+      "target_class": 4,
+      "claim": "标注在约9.64分钟出现短阵VT，当前模型未形成稳定VT输出。",
+      "boundary": "该病例只用于展示能力边界，不能作为VT检出成功案例。",
+      "replay_file": "mitdb_223.json",
+      "summary": {
+        "points": 10,
+        "official_alarm_points": 2,
+        "current_target_argmax_points": 1,
+        "future_target_argmax_points": 0,
+        "max_target_probability_cur": 0.21614953875541687,
+        "max_target_probability_fut": 0.004141951911151409,
+        "max_afib_direction_score": 0.3170032203197479,
+        "rhythm_annotation_count": 2
+      }
+    },
+    "209": {
+      "record_id": "209",
+      "db": "mitdb",
+      "split": "demo_holdout",
+      "tier": "boundary",
+      "title": "AT/SVT易与VT混淆",
+      "short_title": "MIT-BIH 209 · AT/SVT能力边界",
+      "start_min": 9.0,
+      "end_min": 14.8,
+      "target_class": 5,
+      "claim": "所选片段含多次SVTA标注，当前模型常将其归入其他快速心律类别。",
+      "boundary": "AT/SVT数据与验证证据不足，只展示局限，不形成有效识别主张。",
+      "replay_file": "mitdb_209.json",
+      "summary": {
+        "points": 35,
+        "official_alarm_points": 32,
+        "current_target_argmax_points": 0,
+        "future_target_argmax_points": 0,
+        "max_target_probability_cur": 0.19412866234779358,
+        "max_target_probability_fut": 0.021603114902973175,
+        "max_afib_direction_score": 0.06850892305374146,
+        "rhythm_annotation_count": 10
+      }
+    }
+  },
+  "display_cases": [
+    "119",
+    "100",
+    "201"
+  ],
+  "boundary_cases": [
+    "223",
+    "209"
+  ],
+  "default_case": "119",
+  "default_indices": {
+    "119": 4,
+    "100": 17,
+    "201": 10
+  },
+  "external_support_note": "AFib辅助方向由LTAFDB 83记录主分析、84记录敏感性分析支持；不接入正式报警。",
+  "policy_config_version": "overall-risk-v1"
+}

@@ -1,2 +1,0 @@
-{"type": "user_input", "text": "hello", "images": [], "ts": 1778776664.5826597, "checkpoint": {"type": "git", "head": "9dbd8e6cc8f220aa49480de3224fa2d2472922fc", "stash": "a13392a503dc1e3a9783804fa766e53609133be9"}}
-{"type": "error", "message": "claude CLI not found in PATH"}

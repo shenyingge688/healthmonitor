@@ -1,0 +1,20 @@
+{
+  "input_csv": "C:\\HealthMonitor\\current_core_v7\\results_v7_round5\\ensemble_seed014_best_val_full\\final_validation_outputs.csv",
+  "rows": 2188,
+  "patient_or_record_units": 21,
+  "observed": {
+    "rows": 2188,
+    "future_soft_cross_entropy": 1.3355222016182113,
+    "future_soft_kl": 1.0095687941043365,
+    "future_soft_brier": 0.38000721536094934,
+    "future_abnormal_mass_mae": 0.2664028898331953,
+    "future_abnormal_mass_rmse": 0.3545977807311658,
+    "future_abnormal_mass_bias": 0.012948486640830701
+  },
+  "interpretation": {
+    "soft_metrics": "compare future probabilities with the full future-window label distribution",
+    "hard_argmax_metrics": "retained as auxiliary dominant-class evaluation",
+    "threshold_selection_changed": false,
+    "official_round5_alarm_changed": false
+  }
+}

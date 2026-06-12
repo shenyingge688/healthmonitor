@@ -1,0 +1,9 @@
+{
+  "case_id": "119",
+  "record_id": "119",
+  "db": "mitdb",
+  "source_record_path": "data/mitdb/119",
+  "samples": 450000,
+  "target_fs": 250,
+  "source_fs": 360.0
+}

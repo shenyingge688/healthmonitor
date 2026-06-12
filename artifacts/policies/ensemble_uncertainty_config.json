@@ -1,0 +1,43 @@
+{
+  "source_split": "validation",
+  "member_names": [
+    "seed0",
+    "seed1",
+    "seed4"
+  ],
+  "member_csvs": [
+    "results/final_validation_v7_stage1_seed0_best_on_v7val/final_validation_outputs.csv",
+    "results_v7_round5/seed1_best_val_full/final_validation_outputs.csv",
+    "results_v7_round5/seed4_best_val_full/final_validation_outputs.csv"
+  ],
+  "ensemble_size": 3,
+  "risk_definition": "1 - future_normal_probability_per_member",
+  "risk_std_ddof": 0,
+  "confidence_semantics": "descriptive model agreement only; not a clinical confidence interval or correctness probability",
+  "high": {
+    "max_risk_std": 0.08950115638788914,
+    "required_vote_count": 3,
+    "validation_fraction": 0.3953382084095064
+  },
+  "medium": {
+    "max_risk_std": 0.22035152740157565,
+    "required_vote_count": 2,
+    "validation_fraction": 0.4753199268738574
+  },
+  "low": {
+    "validation_fraction": 0.1293418647166362
+  },
+  "validation_risk_std_quantiles": {
+    "q10": 0.014960193941764545,
+    "q25": 0.040266819994666414,
+    "q50": 0.08950115638788914,
+    "q75": 0.15198197456877927,
+    "q90": 0.22035152740157565,
+    "q95": 0.2586538773928256
+  },
+  "validation_vote_fractions": {
+    "unanimous": 0.5827239488117002,
+    "majority_only": 0.36745886654478976,
+    "no_majority": 0.04981718464351006
+  }
+}

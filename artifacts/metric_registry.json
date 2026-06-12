@@ -1,0 +1,197 @@
+{
+  "registry_version": "pre-submission-20260612",
+  "policy_config_version": "overall-risk-v1",
+  "demo_manifest_version": "competition-demo-v2",
+  "formal_capability": {
+    "name": "future_5min_overall_arrhythmia_warning",
+    "score": "1 - P(future Normal)",
+    "threshold": 0.1,
+    "consecutive_k": 2,
+    "ewma_alpha": 0.65,
+    "locked_test_event_recall": 0.925,
+    "locked_test_incident_event_recall": 0.896551724137931,
+    "locked_test_median_lead_time_sec": 290.0,
+    "locked_test_false_alert_episodes_per_patient_hour": 1.1231101511879051,
+    "validation_future_arrhythmia_auroc": 0.7501035416374296,
+    "validation_future_arrhythmia_ap": 0.7306225077193098,
+    "validation_future_pvc_recall": 0.7214137214137214,
+    "validation_future_pvc_auroc": 0.8160016174075928,
+    "validation_future_pvc_ap": 0.6565524319231044
+  },
+  "afib_auxiliary_research": {
+    "scope": "LTAFDB 83-record primary analysis; 84-record sensitivity analysis",
+    "records_primary": 83,
+    "records_sensitivity": 84,
+    "dominant_auroc": 0.7206552653658438,
+    "dominant_average_precision": 0.7063282839047607,
+    "event_recall": 0.6129032258064516,
+    "incident_event_recall": 0.5979557069846678,
+    "median_lead_time_sec": 240.0,
+    "false_alert_episodes_per_patient_hour": 2.32967804346029
+  },
+  "agreement": {
+    "high_max_risk_std": 0.08950115638788914,
+    "high_required_vote_count": 3,
+    "medium_max_risk_std": 0.22035152740157565,
+    "medium_required_vote_count": 2
+  },
+  "demo_cases": {
+    "pvc_alarm": {
+      "case_id": "119",
+      "short_title": "MIT-BIH 119 · PVC",
+      "display_index": 5,
+      "row_index": 4,
+      "timestamp_min": 10.666666666666666,
+      "current_name": "室性早搏 (PVC)",
+      "future_name": "室性早搏 (PVC)",
+      "probabilities_fut": [
+        0.11912774294614792,
+        0.8699864745140076,
+        0.010247886180877686,
+        1.465155719415634e-06,
+        0.0006296177161857486,
+        6.810193099227035e-06
+      ],
+      "probability_normal": 0.11912774294614792,
+      "probability_pvc": 0.8699864745140076,
+      "probability_afib": 0.010247886180877686,
+      "overall_risk_raw": 0.8808722496032715,
+      "signal_quality_score": 1.0,
+      "signal_quality_level": "good",
+      "future_vote_count": 3,
+      "risk_std": 0.08701787143945694,
+      "agreement_level": "high",
+      "afib_direction_score": 0.0792103260755539,
+      "official_alert_active": true,
+      "policy_status": "alert",
+      "summary": {
+        "points": 19,
+        "official_alarm_points": 18,
+        "current_target_argmax_points": 19,
+        "future_target_argmax_points": 19,
+        "max_target_probability_cur": 0.836388111114502,
+        "max_target_probability_fut": 0.8771769404411316,
+        "max_afib_direction_score": 0.25631973147392273,
+        "rhythm_annotation_count": 7
+      }
+    },
+    "normal_no_alarm": {
+      "case_id": "100",
+      "short_title": "MIT-BIH 100 · 正常基线",
+      "display_index": 18,
+      "row_index": 17,
+      "timestamp_min": 12.833333333333334,
+      "current_name": "正常窦性心律",
+      "future_name": "正常窦性心律",
+      "probabilities_fut": [
+        0.9881651401519775,
+        0.010854925028979778,
+        0.0004432491259649396,
+        3.2135861260940146e-07,
+        0.0002695014700293541,
+        0.000266795395873487
+      ],
+      "probability_normal": 0.9881651401519775,
+      "probability_pvc": 0.010854925028979778,
+      "probability_afib": 0.0004432491259649396,
+      "overall_risk_raw": 0.011834859848022461,
+      "signal_quality_score": 1.0,
+      "signal_quality_level": "good",
+      "future_vote_count": 3,
+      "risk_std": 0.12263870984315872,
+      "agreement_level": "medium",
+      "afib_direction_score": 0.00044835664448328316,
+      "official_alert_active": false,
+      "policy_status": "normal",
+      "summary": {
+        "points": 19,
+        "official_alarm_points": 0,
+        "current_target_argmax_points": 19,
+        "future_target_argmax_points": 19,
+        "max_target_probability_cur": 0.5387755632400513,
+        "max_target_probability_fut": 0.9881651401519775,
+        "max_afib_direction_score": 0.02039729245007038,
+        "rhythm_annotation_count": 0
+      }
+    },
+    "afib_auxiliary": {
+      "case_id": "201",
+      "short_title": "MIT-BIH 201 · AFib先导",
+      "display_index": 11,
+      "row_index": 10,
+      "timestamp_min": 28.166666666666668,
+      "current_name": "心房颤动 (AFib)",
+      "future_name": "心房颤动 (AFib)",
+      "probabilities_fut": [
+        0.04749288782477379,
+        0.0810680240392685,
+        0.5733439326286316,
+        0.00018281227676197886,
+        0.013589511625468731,
+        0.2843228876590729
+      ],
+      "probability_normal": 0.04749288782477379,
+      "probability_pvc": 0.0810680240392685,
+      "probability_afib": 0.5733439326286316,
+      "overall_risk_raw": 0.9525071382522583,
+      "signal_quality_score": 1.0,
+      "signal_quality_level": "good",
+      "future_vote_count": 3,
+      "risk_std": 0.08118798583745956,
+      "agreement_level": "high",
+      "afib_direction_score": 0.9235018491744995,
+      "official_alert_active": true,
+      "policy_status": "alert",
+      "summary": {
+        "points": 19,
+        "official_alarm_points": 18,
+        "current_target_argmax_points": 10,
+        "future_target_argmax_points": 18,
+        "max_target_probability_cur": 0.6178978681564331,
+        "max_target_probability_fut": 0.687556803226471,
+        "max_afib_direction_score": 0.9372299909591675,
+        "rhythm_annotation_count": 1
+      }
+    }
+  },
+  "boundary_cases": {
+    "vt_vs_normal": {
+      "status": "stopped_gate_not_met",
+      "positive_records": 7,
+      "event_recall": 0.6666666666666666,
+      "median_lead_time_sec": 215.0,
+      "false_alert_episodes_per_patient_hour": 2.850971922246221,
+      "official_alarm_changed": false
+    },
+    "vf_vs_normal": {
+      "status": "stopped_insufficient_positive_records",
+      "positive_records": 1,
+      "event_recall": null,
+      "median_lead_time_sec": null,
+      "false_alert_episodes_per_patient_hour": null,
+      "official_alarm_changed": false
+    },
+    "vt_vf_vs_normal": {
+      "status": "passed_retraining_gate",
+      "positive_records": 8,
+      "event_recall": 0.21428571428571427,
+      "median_lead_time_sec": 240.0,
+      "false_alert_episodes_per_patient_hour": 0.43196544276457893,
+      "official_alarm_changed": false
+    },
+    "tachy_vs_normal": {
+      "status": "passed_retraining_gate",
+      "positive_records": 8,
+      "event_recall": 0.23076923076923078,
+      "median_lead_time_sec": 130.0,
+      "false_alert_episodes_per_patient_hour": 0.2591792656587474,
+      "official_alarm_changed": false
+    }
+  },
+  "sources": {
+    "formal_policy": "C:\\HealthMonitor\\artifacts\\policies\\final_alert_policy_selected.json",
+    "locked_validation": "C:\\HealthMonitor\\artifacts\\evidence\\locked_validation_observed_metrics.json",
+    "ltafdb_external": "C:\\HealthMonitor\\artifacts\\evidence\\ltafdb_full_observed_metrics.json",
+    "demo_replays": "C:\\HealthMonitor\\artifacts\\demo"
+  }
+}

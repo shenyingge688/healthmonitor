@@ -1,0 +1,46 @@
+[
+  {
+    "task": "future_arrhythmia",
+    "policy_role": "default",
+    "model_candidate": "ensemble_seed014_best_logits",
+    "checkpoints": [
+      "models_v7_stage1/seeds/seed0/arrhythmia_warning_best.pth",
+      "models_v7_stage1/seeds/seed1/arrhythmia_warning_best.pth",
+      "models_v7_stage1/seeds/seed4/arrhythmia_warning_best.pth"
+    ],
+    "probability_source": "uncalibrated",
+    "threshold": 0.1,
+    "consecutive_k": 2,
+    "smoothing_method": "ewma",
+    "smoothing_window": 1,
+    "smoothing_alpha": 0.65,
+    "refractory_windows": 0,
+    "validation_event_recall": 0.9122807017543859,
+    "validation_incident_event_recall": 0.9111111111111111,
+    "validation_median_lead_time_sec": 290.0,
+    "validation_false_alert_windows_per_patient_hour": 28.164146868250548,
+    "validation_false_alert_episodes_per_patient_hour": 1.7278617710583157,
+    "locked_test_event_recall": 0.925,
+    "locked_test_incident_event_recall": 0.896551724137931,
+    "locked_test_median_lead_time_sec": 290.0,
+    "locked_test_false_alert_windows_per_patient_hour": 22.203023758099356,
+    "locked_test_false_alert_episodes_per_patient_hour": 1.1231101511879051,
+    "decision": "accepted_round5_seed014_ensemble_arrhythmia_policy"
+  },
+  {
+    "task": "future_vt_vf",
+    "policy_role": "conservative_exploratory",
+    "probability_source": "temp_scaled",
+    "threshold": 0.04,
+    "consecutive_k": 12,
+    "smoothing_method": "raw",
+    "smoothing_window": 1,
+    "smoothing_alpha": 1.0,
+    "refractory_windows": 0,
+    "locked_test_event_recall": 0.6,
+    "locked_test_incident_event_recall": 0.6,
+    "locked_test_median_lead_time_sec": 300.0,
+    "locked_test_false_alert_episodes_per_patient_hour": 1.3822894168466526,
+    "decision": "keep_round3_conservative_policy_for_exploratory_vt_vf_only"
+  }
+]
